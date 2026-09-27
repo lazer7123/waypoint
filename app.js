@@ -17,21 +17,26 @@ const DEFAULTS = {
   fov: 14,              // degrees across the display (for lining pins up with the world)
   offset: 0,            // extra heading trim, degrees
   north: "magnetic",    // what the glasses' compass reports: magnetic (we add the local declination) | true
+  autoAlign: true,      // learn the exact heading correction from GPS while you walk
 };
+const ORB_H = 1.6;      // orbs hover at eye height above the floor they were dropped on (metres)
+const ARRIVE_M = 1.2;   // this close (same floor) counts as standing on the pin
+const AHEAD = 1.52;     // "5 ft ahead" (metres)
 const CHOICES = { units: ["ft", "m"], heightMode: ["floors", "altitude"], gps: ["auto", "always", "off"], north: ["magnetic", "true"] };
 const LIMITS = { floorH: [2.4, 6], stepLen: [0.4, 1.1], stepSens: [0.3, 4], fov: [5, 60], offset: [-180, 180] };
 const CYAN = "#33ddff", GREEN = "#7fff9f", WHITE = "#ffffff", DIM = "#8a8a8a", RED = "#ff6a5a";
 
 // ---------- saved state ----------
-const S = { pins: [], settings: { ...DEFAULTS }, cal: null, floor: 1, work: null, pos: { e: 0, n: 0 }, target: null, mapZoom: 18, decl: null };
+const S = { pins: [], settings: { ...DEFAULTS }, cal: null, floor: 1, work: null, pos: { e: 0, n: 0 }, target: null, mapZoom: 18, decl: null, align: null };
 // ---------- live state ----------
 const RT = {
   screen: "start", list: null, stack: [],
-  Rs: null, raw: null, absolute: false, lastAbsT: -1e9, samples: [],
-  orientCount: 0, orientRate: 0, motionCount: 0, motionRate: 0,
+  raw: null, absolute: false, samples: [],
+  head: new G.AngleAvg(0.3), headSlow: new G.AngleAvg(0.03), pitch: null, aligner: new G.HeadingAligner(), courseFrom: null, courseHead: null,
+  orientCount: 0, orientRate: 0,
   pose: null, walkHeading: null,
   steps: new G.StepDetector(), filter: new G.PosFilter(), accel: NaN,
-  fix: null, fixes: 0, lastStepT: -1e9, lastCand: -1e9, streak: 0, walkSteps: 0, yawRate: 0, prevH: null, prevHT: 0,
+  fix: null, fixes: 0, gpsConfirmed: false, lastStepT: -1e9, lastCand: -1e9, streak: 0, walkSteps: 0, yawRate: 0, prevH: null, prevHT: 0,
   sawAbs: false, lastOrientT: -1e9, decl: 0, declAt: null, home: "ar", hist: 0, pendingGo: 0, navigating: false, frameErr: null, alt: null, geoErr: null, geoStarted: false,
   toastUntil: 0, confirm: null, calStep: 0, calCaps: [], calMsg: "",
 };
@@ -51,14 +56,28 @@ function load() {
   try {
     const j = JSON.parse(localStorage.getItem(STORE) || "null");
     if (j) {
-      S.pins = Array.isArray(j.pins) ? j.pins.filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lon)) : [];
+      S.pins = Array.isArray(j.pins) ? j.pins.filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lon)).map((p, i) => ({
+        ...p,
+        id: typeof p.id === "string" && p.id ? p.id : `p${i}${Date.now().toString(36)}`,
+        name: typeof p.name === "string" && p.name ? p.name.slice(0, 40) : `Pin ${i + 1}`,
+        floor: Number.isFinite(p.floor) ? G.clamp(Math.round(p.floor), -9, 200) : 1,
+        t: Number.isFinite(p.t) ? p.t : Date.now(),
+        alt: Number.isFinite(p.alt) ? p.alt : null,
+        acc: Number.isFinite(p.acc) ? p.acc : 50,
+      })) : [];
       S.settings = cleanSettings(j.settings);
       S.cal = validCal(j.cal) ? j.cal : null;
-      S.floor = Number.isFinite(j.floor) ? j.floor : 1;
-      S.work = j.work && Number.isFinite(j.work.lat) ? j.work : null;
-      S.pos = j.pos && Number.isFinite(j.pos.e) ? j.pos : { e: 0, n: 0 };
+      S.floor = Number.isFinite(j.floor) ? G.clamp(Math.round(j.floor), -9, 200) : 1;
+      S.work = j.work && Number.isFinite(j.work.lat) && Number.isFinite(j.work.lon) ? { lat: j.work.lat, lon: j.work.lon, ...(j.work.prov ? { prov: true } : {}) } : null;
+      S.pos = j.pos && Number.isFinite(j.pos.e) && Number.isFinite(j.pos.n) ? j.pos : { e: 0, n: 0 };
+      S.posT = Number.isFinite(j.posT) ? j.posT : 0;
       S.target = j.target ?? null;
       S.mapZoom = Number.isFinite(j.mapZoom) ? G.clamp(j.mapZoom, 12, 19) : 18;
+      const a = j.align;
+      if (a && [a.sx, a.sy, a.n].every(Number.isFinite) && a.n >= 0 && a.n <= 40 && Math.hypot(a.sx, a.sy) <= a.n + 1e-6) {
+        RT.aligner = new G.HeadingAligner({ sx: a.sx, sy: a.sy, n: a.n, value: Number.isFinite(a.value) ? a.value : null });
+        if (Number.isFinite(a.decl)) RT.aligner.decl = a.decl;
+      }
       if (j.decl && [j.decl.v, j.decl.lat, j.decl.lon].every(Number.isFinite)) {
         // Last known declination: correct magnetic north right away, before any GPS fix.
         S.decl = j.decl; RT.decl = j.decl.v; RT.declAt = { lat: j.decl.lat, lon: j.decl.lon, stale: true };
@@ -67,7 +86,12 @@ function load() {
   } catch { /* storage unavailable: start fresh */ }
   const f = RT.filter;
   f.e = S.pos.e; f.n = S.pos.n;
-  if (S.work && !S.work.prov) { f.has = true; f.P = 60 * 60; } // last known spot; the next fix corrects it
+  if (S.work && !S.work.prov) {
+    // Last known spot. If it's more than a couple of minutes old you may be anywhere now: trust the
+    // first GPS fix of this session completely, however rough it is.
+    f.has = true;
+    f.P = Date.now() - (S.posT || 0) < 120000 ? 30 * 30 : 1e8;
+  }
 }
 function cleanSettings(raw) {
   const out = { ...DEFAULTS };
@@ -80,11 +104,15 @@ function cleanSettings(raw) {
   }
   return out;
 }
-const vec3 = (v) => Array.isArray(v) && v.length === 3 && v.every(Number.isFinite);
-function validCal(c) { return !!c && vec3(c.fwd) && vec3(c.right) && vec3(c.up) && typeof c.mirror === "boolean"; }
+function validCal(c) {
+  return !!c && c.kind === "simple" && (c.hSign === 1 || c.hSign === -1) && (c.pSign === 1 || c.pSign === -1)
+    && (c.pAxis === "b" || c.pAxis === "g") && Number.isFinite(c.pZero);
+}
 
 function save() {
   S.pos = { e: RT.filter.e, n: RT.filter.n };
+  if (RT.gpsConfirmed) S.posT = Date.now(); // only a position GPS has confirmed this session counts as fresh
+  S.align = RT.aligner.toJSON();
   try { localStorage.setItem(STORE, JSON.stringify(S)); } catch { /* ignore */ }
 }
 let posSaveAt = 0;
@@ -101,14 +129,26 @@ function onOrient(ev, isAbs) {
   const abs = !!(isAbs || ev.absolute);
   // Once a north-locked (absolute) stream has been seen, never mix in the relative one: its zero is arbitrary.
   if (!abs && RT.sawAbs) return;
-  if (abs && !RT.sawAbs) { RT.sawAbs = true; RT.Rs = null; RT.samples = []; }
+  if (abs && !RT.sawAbs) { RT.sawAbs = true; RT.head = new G.AngleAvg(0.3); RT.headSlow = new G.AngleAvg(0.03); RT.samples = []; }
   RT.absolute = abs;
   RT.lastOrientT = now;
   RT.raw = { a, b, g };
   RT.orientCount++;
   RT.samples.push({ a, b, g, t: now });
   while (RT.samples.length && now - RT.samples[0].t > 1000) RT.samples.shift();
-  if (S.cal) RT.Rs = G.blendRot(RT.Rs, G.rotForReading(a, b, g, S.cal), 0.25);
+  if (S.cal) {
+    const pose = G.readPose(RT.raw, S.cal);
+    RT.pitch = RT.pitch == null ? pose.pitch : RT.pitch + (pose.pitch - RT.pitch) * 0.3;
+    // Looking steeply up/down, a compass heading gets unreliable: hold the last one.
+    if (Math.abs(pose.pitch) < 70 || RT.head.value == null) {
+      RT.head.push(pose.heading);
+      if (Math.abs(pose.pitch) < 30) {
+        RT.headSlow.push(pose.heading);
+        const ch = RT.courseHead; // heading averaged over the current GPS stretch (for auto-align)
+        if (ch) { ch.c += Math.cos(pose.heading * G.D2R); ch.s += Math.sin(pose.heading * G.D2R); ch.n++; }
+      }
+    }
+  }
 }
 window.addEventListener("deviceorientationabsolute", (e) => onOrient(e, true));
 window.addEventListener("deviceorientation", (e) => onOrient(e, false));
@@ -117,7 +157,7 @@ window.addEventListener("devicemotion", (ev) => {
   const a = ev.accelerationIncludingGravity || ev.acceleration;
   if (!a || a.x == null) return;
   const mag = Math.hypot(a.x, a.y || 0, a.z || 0);
-  RT.accel = mag; RT.motionCount++;
+  RT.accel = mag;
   const now = performance.now();
   if (!RT.steps.push(mag, now, S.settings.stepSens)) return;
   // A nod or head turn also bounces the sensor. Count it as walking only with a steady rhythm
@@ -150,7 +190,8 @@ function onFix(p) {
   const c = p.coords;
   RT.fixes++; RT.geoErr = null;
   RT.fix = { lat: c.latitude, lon: c.longitude, acc: Number.isFinite(c.accuracy) ? c.accuracy : 50,
-             alt: c.altitude, altAcc: c.altitudeAccuracy, t: Date.now() };
+             alt: c.altitude, altAcc: c.altitudeAccuracy, course: c.heading, speed: c.speed, t: Date.now() };
+  learnAlignment(RT.fix);
   if (Number.isFinite(c.altitude)) RT.alt = RT.alt == null ? c.altitude : RT.alt + (c.altitude - RT.alt) * 0.3;
   const f = RT.filter, mode = S.settings.gps, acc = RT.fix.acc;
   if (mode === "off" && f.has) return;
@@ -160,7 +201,59 @@ function onFix(p) {
   const z = G.enu(S.work.lat, S.work.lon, RT.fix.lat, RT.fix.lon);
   predict();
   f.fix(z.e, z.n, acc);
+  RT.gpsConfirmed = true;
   afterMove();
+}
+
+/**
+ * While you walk outdoors, GPS knows which way you're going. You mostly look where you walk, so the
+ * steady difference between that and the glasses' heading is the exact correction (magnetic north,
+ * sensor quirks, anything). Only uses moments that look like steady walking with your head level.
+ */
+function learnAlignment(fix) {
+  if (!S.settings.autoAlign || !S.cal) return;
+  const now = performance.now();
+  // Only while really walking: a steady step rhythm right now (GPS drift while standing still
+  // can look like movement, and would teach a wrong correction).
+  const walking = RT.streak >= 3 && now - RT.lastStepT < 2000;
+  const from = RT.courseFrom;
+  let course = null, head = null;
+  if (walking && Number.isFinite(fix.course) && fix.course >= 0 && Number.isFinite(fix.speed) && fix.speed >= 0.6 && fix.acc <= 15) {
+    course = fix.course;
+    head = RT.headSlow.steadiness >= 0.9 ? RT.headSlow.value : null;
+  } else if (from && walking && fix.acc <= 12 && fix.t - from.t <= 45000) {
+    const d = G.enu(from.lat, from.lon, fix.lat, fix.lon);
+    const dist = Math.hypot(d.e, d.n), speed = dist / Math.max((fix.t - from.t) / 1000, 0.1);
+    if (dist < Math.max(6, from.acc + fix.acc)) return; // not far enough yet to trust the direction
+    if (speed >= 0.5 && speed <= 2.5) {
+      course = G.bearingOf(d.e, d.n);
+      // compare with where your head pointed over the same stretch, not just the last moment
+      const h = RT.courseHead;
+      if (h && h.n >= 10 && Math.hypot(h.c, h.s) / h.n >= 0.9) head = G.wrap360(Math.atan2(h.s, h.c) * G.R2D);
+    }
+  }
+  // start a new stretch from here
+  RT.courseFrom = fix.acc <= 12 && walking ? fix : null;
+  RT.courseHead = RT.courseFrom ? { c: 0, s: 0, n: 0 } : null;
+  if (course == null || head == null) return;
+  if (RT.pitch == null || Math.abs(RT.pitch) > 25 || RT.yawRate > 30) return;
+  const before = RT.aligner.ready;
+  if (RT.aligner.add(course, head)) {
+    RT.aligner.decl = RT.decl; // remember the local magnetic declination it was learned with
+    if (!before) toast(`Heading aligned (${fmtSigned(RT.aligner.value)})`);
+    savePosSoon();
+  }
+}
+
+/** Degrees to add to the glasses' heading to get true north. */
+function headingCorrection() {
+  const s = S.settings;
+  // A learned correction includes the magnetic declination where it was learned; adjust it if you've
+  // travelled somewhere the declination differs.
+  const shift = s.north === "magnetic" && Number.isFinite(RT.aligner.decl) ? RT.decl - RT.aligner.decl : 0;
+  const learned = s.autoAlign && RT.aligner.ready ? RT.aligner.value + shift : null;
+  const base = learned !== null ? learned : s.north === "magnetic" ? RT.decl : 0;
+  return base + s.offset;
 }
 
 /** Grow position doubt with time. Walking with steps counted: steps carry the movement.
@@ -208,7 +301,6 @@ function here() {
 
 setInterval(() => {
   RT.orientRate = RT.orientCount; RT.orientCount = 0;
-  RT.motionRate = RT.motionCount; RT.motionCount = 0;
 }, 1000);
 document.addEventListener("visibilitychange", () => { if (document.hidden) save(); });
 window.addEventListener("pagehide", save);
@@ -244,9 +336,14 @@ function uniqueName(base) {
   return `${base} ${i}`;
 }
 
-function dropPin(name) {
+function dropPin(name, ahead = 0) {
+  if (ahead && !RT.pose) { toast("No heading yet — can't place it ahead"); return; }
   if (!S.work) S.work = { lat: 0, lon: 0, prov: true }; // no fix yet: steps only, tied to the map later
-  const me = here();
+  let me = here();
+  if (ahead) {
+    const h = RT.pose.heading * G.D2R;
+    me = G.offsetLatLon(me.lat, me.lon, ahead * Math.sin(h), ahead * Math.cos(h));
+  }
   const pin = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5), name, lat: me.lat, lon: me.lon,
                 floor: S.floor, alt: RT.alt, acc: RT.filter.sigma, t: Date.now() };
   if (S.work.prov) pin.prov = true;
@@ -462,7 +559,10 @@ function mainMenu() {
   return {
     title: "Waypoint",
     items: [
-      { label: "Drop pin here", enter: () => openList(dropMenu) },
+      { label: "Drop pin here", enter: () => openList(() => dropMenu(0)) },
+      RT.pose
+        ? { label: S.settings.units === "ft" ? "Drop pin 5 ft ahead" : "Drop pin 1.5 m ahead", enter: () => openList(() => dropMenu(AHEAD)) }
+        : { label: "Drop ahead (needs compass)" },
       { label: "Pins", value: () => String(S.pins.length), enter: () => openList(pinsMenu) },
       { label: "Floor", value: () => String(S.floor), left: () => setFloor(S.floor - 1), right: () => setFloor(S.floor + 1) },
       RT.home === "map"
@@ -476,10 +576,10 @@ function mainMenu() {
   };
 }
 
-function dropMenu() {
-  const drop = (name) => { dropPin(name); closeAll(); };
+function dropMenu(ahead) {
+  const drop = (name) => { dropPin(name, ahead); closeAll(); };
   return {
-    title: `Drop pin · floor ${S.floor}`,
+    title: ahead ? `Drop ${S.settings.units === "ft" ? "5 ft" : "1.5 m"} ahead · floor ${S.floor}` : `Drop pin · floor ${S.floor}`,
     items: [
       { input: true, label: "Say or write a name…", submit: (v) => drop(uniqueName(v.slice(0, 30))) },
       ...NAMES.map((n) => ({ label: n, enter: () => drop(uniqueName(n)) })),
@@ -533,6 +633,8 @@ function settingsMenu() {
       { label: "GPS", value: () => ({ auto: "auto", always: "always", off: "off (indoors)" })[s.gps], left: () => set("gps", cycle(["auto", "always", "off"], s.gps, -1)), right: () => set("gps", cycle(["auto", "always", "off"], s.gps, 1)) },
       { label: "View width", value: () => `${s.fov}°`, left: () => set("fov", G.clamp(s.fov - 1, 5, 60)), right: () => set("fov", G.clamp(s.fov + 1, 5, 60)) },
       { label: "Compass north", value: () => (s.north === "magnetic" ? `magnetic (fix ${fmtDecl()})` : "true"), left: flip("north", "magnetic", "true"), right: flip("north", "magnetic", "true") },
+      { label: "Auto-align (walking)", value: () => (s.autoAlign ? (RT.aligner.ready ? `on · ${fmtAlign()}` : "on · learning") : "off"), left: () => set("autoAlign", !s.autoAlign), right: () => set("autoAlign", !s.autoAlign) },
+      { label: "Reset alignment", enter: () => { RT.aligner = new G.HeadingAligner(); save(); toast("Alignment reset — walk outside to relearn"); refreshValues(); } },
       { label: "Heading trim", value: () => `${s.offset > 0 ? "+" : ""}${s.offset}°`, left: () => set("offset", G.clamp(s.offset - 1, -180, 180)), right: () => set("offset", G.clamp(s.offset + 1, -180, 180)) },
       { label: confirming ? "Pinch again to delete ALL pins" : "Delete all pins", danger: true,
         enter: () => { if (confirming) { S.pins = []; S.target = null; RT.confirm = null; save(); toast("All pins deleted"); } else RT.confirm = "delall"; refreshValues(); } },
@@ -551,8 +653,8 @@ function sensorsMenu() {
     title: "Sensors",
     items: [
       { label: "Heading", value: () => (RT.pose ? `${Math.round(RT.pose.heading)}° ${G.cardinal(RT.pose.heading)} (trim ${s.offset > 0 ? "+" : ""}${s.offset}°)` : "calibrate first"), left: () => setOff(-1), right: () => setOff(1) },
-      { label: "North fix", value: () => (s.north === "magnetic" ? `${fmtDecl()} (magnetic→true)` : "off (compass is true)") },
-      { label: "Pitch · roll", value: () => (RT.pose ? `${Math.round(RT.pose.pitch) || 0}° · ${Math.round(RT.pose.roll) || 0}°` : "–") },
+      { label: "Correction", value: () => `${fmtSigned(headingCorrection())} (${s.autoAlign && RT.aligner.ready ? "learned walking" : s.north === "magnetic" ? "magnetic north " + fmtDecl() : "none"})` },
+      { label: "Pitch", value: () => (RT.pose ? `${Math.round(RT.pose.pitch) || 0}°` : "–") },
       { label: "Compass", value: () => (RT.raw ? `${RT.absolute ? "absolute" : "relative!"} · ${RT.orientRate}/s` : "no data") },
       { label: "Raw α β γ", value: () => (RT.raw ? `${fmt(RT.raw.a)} ${fmt(RT.raw.b)} ${fmt(RT.raw.g)}` : "–") },
       { label: "Motion", value: () => `${fmt(RT.accel, 1)} m/s² · ${RT.walkSteps} steps (${RT.steps.count} bounces)` },
@@ -588,18 +690,20 @@ function captureCal() {
   RT.calStep++;
   if (RT.calStep < 3) return;
   const [level, right, down] = RT.calCaps;
-  const cal = G.solveCalibration(level, right, down);
+  const cal = G.solveSimpleCal(level, right, down);
   if (!cal.ok) {
     RT.calCaps = []; RT.calStep = 0;
     RT.calMsg = cal.why === "down" ? "Didn't see you look down — let's go again" : "Didn't see you turn right — let's go again";
     return;
   }
-  S.cal = { fwd: cal.fwd, right: cal.right, up: cal.up, mirror: cal.mirror, offset: 0 };
-  RT.Rs = null;
+  const flipped = S.cal && S.cal.hSign !== cal.hSign;
+  S.cal = { kind: "simple", hSign: cal.hSign, pAxis: cal.pAxis, pSign: cal.pSign, pZero: cal.pZero };
+  if (flipped) RT.aligner = new G.HeadingAligner(); // a learned correction from the old setup no longer applies
+  RT.head = new G.AngleAvg(0.3); RT.headSlow = new G.AngleAvg(0.03); RT.pitch = null;
   save();
   go(RT.home);
   syncHistory();
-  toast("Calibrated");
+  toast(cal.pAxis === "g" ? "Calibrated — unusual sensor layout, heading may shift as you look up/down" : "Calibrated", 3500);
 }
 
 // ---------- input ----------
@@ -700,38 +804,45 @@ function updateDecl() {
     save();
   }
 }
+function fmtSigned(v) { return `${v >= 0 ? "+" : ""}${v.toFixed(1)}°`; }
+function fmtAlign() { return fmtSigned(RT.aligner.value); }
 function fmtDecl() { return RT.declAt ? `${RT.decl >= 0 ? "+" : ""}${RT.decl.toFixed(1)}°` : "needs GPS"; }
 
 let lastDraw = 0;
+/** Head pose for this moment (also needed while a menu is open: steps and "drop ahead" use it). */
+function updatePose() {
+  updateDecl();
+  RT.pose = null;
+  if (!S.cal || RT.head.value == null || RT.pitch == null) return;
+  const raw = RT.head.value;
+  RT.pose = { heading: G.wrap360(raw + headingCorrection()), pitch: RT.pitch };
+  const now = performance.now();
+  if (RT.prevH != null && now > RT.prevHT) { // turn speed from the raw heading (corrections don't count)
+    const rate = Math.abs(G.wrap180(raw - RT.prevH)) / ((now - RT.prevHT) / 1000);
+    RT.yawRate += (Math.min(rate, 720) - RT.yawRate) * 0.3;
+  }
+  RT.prevH = raw; RT.prevHT = now;
+  if (Math.abs(RT.pose.pitch) < 60) RT.walkHeading = RT.pose.heading; // steady walking direction
+}
+
 function frame(now) {
   requestAnimationFrame(frame); // keep going even if something below throws
   if (now - lastDraw < 32) return; // ~30 fps is plenty and saves battery
   lastDraw = now;
   if (!toastEl.hidden && performance.now() > RT.toastUntil) toastEl.hidden = true;
-  if (RT.screen === "list") return; // the menu covers the view
   try {
-    updateDecl();
-    if (S.cal) S.cal.offset = S.settings.offset + (S.settings.north === "magnetic" ? RT.decl : 0);
-    if (RT.Rs && S.cal) {
-      RT.pose = G.headPose(RT.Rs, S.cal);
-      const now = performance.now();
-      if (RT.prevH != null && now > RT.prevHT) {
-        const rate = Math.abs(G.wrap180(RT.pose.heading - RT.prevH)) / ((now - RT.prevHT) / 1000);
-        RT.yawRate += (Math.min(rate, 720) - RT.yawRate) * 0.3;
-      }
-      RT.prevH = RT.pose.heading; RT.prevHT = now;
-      if (Math.abs(RT.pose.pitch) < 60) RT.walkHeading = RT.pose.heading; // steady walking direction
-    }
+    updatePose();
+    if (RT.screen === "list") return; // the menu covers the view
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
     if (RT.screen === "start") drawStart();
     else if (RT.screen === "ar") drawAR();
     else if (RT.screen === "map") drawMap();
     else if (RT.screen === "calib") drawCalib();
-    if (!toastEl.hidden && performance.now() > RT.toastUntil) toastEl.hidden = true;
     RT.frameErr = null;
   } catch (e) {
     RT.frameErr = String(e && e.message || e);
+    if (typeof ctx.reset === "function") ctx.reset(); // drops any clip/save left half-done
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.filter = "none"; ctx.globalAlpha = 1;
     ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
     wrapText(`Something went wrong: ${RT.frameErr}`, CX, CY - 20, 520, 28, { size: 20, color: RED });
@@ -750,122 +861,249 @@ function drawCalib() {
   if (RT.calMsg) wrapText(RT.calMsg, CX, 380, 500, 30, { size: 22, color: RED });
   const r = RT.raw;
   text(r ? `compass ${Math.round(r.a)}° · ${RT.absolute ? "absolute" : "relative"} · ${RT.orientRate}/s` : "waiting for compass…", CX, 500, { size: 18, color: DIM, weight: 500 });
-  text(S.cal ? "Swipe down to cancel" : "", CX, 540, { size: 18, color: DIM, weight: 500 });
+  text(S.cal ? "Back gesture to cancel" : "", CX, 540, { size: 18, color: DIM, weight: 500 });
 }
 
 function focal() { return (W / 2) / Math.tan((S.settings.fov / 2) * G.D2R); }
 
+const RGB = { cyan: "51,221,255", green: "127,255,159" };
+let labels = []; // orb labels drawn this frame, so they don't pile on top of each other
+
+/** Place a label near (x, y), nudging it up past any label already there. */
+function placeLabel(str, x, y, opts) {
+  ctx.font = `${opts.weight || 600} ${opts.size || 20}px system-ui, -apple-system, Roboto, sans-serif`;
+  const w = ctx.measureText(str).width, h = (opts.size || 20) + 4;
+  let top = y - h / 2;
+  for (let guard = 0; guard < 8; guard++) {
+    const hit = labels.find((r) => Math.abs(r.x - x) < (r.w + w) / 2 && Math.abs(r.top - top) < h);
+    if (!hit) break;
+    top = hit.top - h;
+  }
+  labels.push({ x, w, top });
+  text(str, x, top + h / 2, opts);
+}
+
 function drawAR() {
   if (!S.cal) { text("Needs calibrating — pinch for the menu", CX, CY, { size: 22 }); return; }
-  if (!RT.Rs || !RT.pose) { text("Waiting for the compass…", CX, CY, { size: 24 }); drawStatus(); return; }
-  const heading = RT.pose.heading;
-  drawTape(heading);
+  if (!RT.pose) { text("Waiting for the compass…", CX, CY, { size: 24 }); drawStatus(); return; }
+  const { heading, pitch } = RT.pose;
   const F = focal();
   const target = targetPin();
+  const t = performance.now() / 1000;
+  drawTape(heading);
   const items = [];
   for (const pin of S.pins) {
     const rel = relOf(pin);
     if (!rel) continue;
-    const p = G.project(RT.Rs, S.cal, rel, F, CX, CY);
-    items.push({ pin, rel, p });
+    const orb = { e: rel.e, n: rel.n, up: rel.up + ORB_H }; // hovering above the floor it was dropped on
+    const p = G.projectHP(heading, pitch, orb, F, CX, CY);
+    items.push({ pin, rel, orb, p, isT: !!target && pin.id === target.id });
   }
   items.sort((a, b) => b.p.dist - a.p.dist); // far first, near on top
+  let arrived = null;
   for (const it of items) {
-    const isT = target && it.pin.id === target.id;
-    const on = it.p.z > 0.02 && it.p.x > -20 && it.p.x < W + 20 && it.p.y > 50 && it.p.y < H - 40;
-    if (on) drawPin(it, isT);
-    else drawEdge(it, isT);
+    if (it.rel.flat < ARRIVE_M && !levelText(it.pin, it.rel) && (!arrived || it.isT)) arrived = it;
   }
-  if (target) {
-    const it = items.find((i) => i.pin.id === target.id);
-    if (it) drawGuide(it, heading);
+  labels = [];
+  for (const it of items) {
+    const on = it.p.z > 0.02 && it.p.x > -40 && it.p.x < W + 40 && it.p.y > 40 && it.p.y < H + 40;
+    if (on) drawOrb(it, F, t);
+    else if (it !== arrived && (it.isT || S.pins.length <= 3)) drawOffscreen(it, heading, pitch);
   }
-  if (performance.now() - RT.lastOrientT > 3000) text("Compass stopped — close and reopen the app", CX, 470, { size: 17, color: RED, weight: 600 });
-  else if (!RT.absolute) text("Compass isn't locked to north — pins may drift", CX, 470, { size: 17, color: RED, weight: 600 });
+  RT.arrivedName = arrived ? arrived.pin.name : null;
+  if (arrived) drawArrived(arrived, t);
+  drawMiniMap(heading, items);
+  const focus = items.find((i) => i.isT) || (items.length ? items.reduce((a, b) => (a.rel.flat < b.rel.flat ? a : b)) : null);
+  if (focus) drawGuide(focus, heading, pitch, arrived === focus);
+  if (performance.now() - RT.lastOrientT > 3000) text("Compass stopped — close and reopen the app", CX, 108, { size: 17, color: RED });
+  else if (!RT.absolute) text("Compass isn't locked to north", CX, 108, { size: 17, color: RED });
   drawStatus();
 }
 
 function drawTape(heading) {
-  const span = 45, y = 34, pxPerDeg = 540 / (span * 2);
+  const span = 40, y = 26, pxPerDeg = 400 / (span * 2);
   ctx.strokeStyle = DIM; ctx.lineWidth = 2;
   for (let d = Math.ceil((heading - span) / 5) * 5; d <= heading + span; d += 5) {
     const x = CX + (d - heading) * pxPerDeg;
     const big = G.wrap360(d) % 45 === 0;
-    ctx.beginPath(); ctx.moveTo(x, y + 14); ctx.lineTo(x, y + (big ? 2 : 8)); ctx.stroke();
-    if (big) text(G.cardinal(d), x, y - 10, { size: 18, color: G.wrap360(d) === 0 ? RED : WHITE, weight: 700 });
+    ctx.beginPath(); ctx.moveTo(x, y + 12); ctx.lineTo(x, y + (big ? 2 : 7)); ctx.stroke();
+    if (big) text(G.cardinal(d), x, y - 10, { size: 16, color: G.wrap360(d) === 0 ? RED : WHITE, weight: 700 });
   }
   for (const pin of S.pins) {
     const rel = relOf(pin);
     if (!rel || rel.flat < 1) continue;
     const rd = G.wrap180(G.bearingOf(rel.e, rel.n) - heading);
     const x = CX + G.clamp(rd, -span, span) * pxPerDeg;
-    const isT = pin.id === S.target;
-    ctx.fillStyle = isT ? CYAN : GREEN;
-    ctx.beginPath(); ctx.moveTo(x, y + 18); ctx.lineTo(x - 7, y + 30); ctx.lineTo(x + 7, y + 30); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = pin.id === S.target ? CYAN : GREEN;
+    ctx.beginPath(); ctx.arc(x, y + 20, pin.id === S.target ? 5 : 3.5, 0, Math.PI * 2); ctx.fill();
   }
   ctx.fillStyle = WHITE;
-  ctx.beginPath(); ctx.moveTo(CX, y + 16); ctx.lineTo(CX - 6, y + 4); ctx.lineTo(CX + 6, y + 4); ctx.closePath(); ctx.fill();
-  text(`${Math.round(heading)}°`, CX, y + 46, { size: 16, color: CYAN, weight: 700 });
+  ctx.beginPath(); ctx.moveTo(CX, y + 14); ctx.lineTo(CX - 5, y + 4); ctx.lineTo(CX + 5, y + 4); ctx.closePath(); ctx.fill();
 }
 
-function drawPin({ pin, rel, p }, isT) {
-  const color = isT ? CYAN : GREEN;
-  const r = G.clamp(150 / Math.sqrt(Math.max(p.dist, 4)), 7, 26);
-  const stem = G.clamp(r * 2.2, 18, 60);
-  // ground spot
-  ctx.strokeStyle = color; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.ellipse(p.x, p.y, r * 0.9, r * 0.35, 0, 0, Math.PI * 2); ctx.stroke();
-  // stem and head floating above it
-  ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x, p.y - stem); ctx.stroke();
-  ctx.fillStyle = color;
-  const hy = p.y - stem - r;
-  ctx.beginPath(); ctx.moveTo(p.x, hy - r); ctx.lineTo(p.x + r, hy); ctx.lineTo(p.x, hy + r); ctx.lineTo(p.x - r, hy); ctx.closePath(); ctx.fill();
-  const lvl = levelText(pin, rel);
-  text(pin.name, p.x, hy - r - 26, { size: isT ? 24 : 20, color: WHITE, weight: 700 });
-  text(`${G.fmtDist(rel.flat, S.settings.units)}${lvl ? " · " + lvl : ""}`, p.x, hy - r - 6, { size: 18, color, weight: 600 });
+/** A glowing orb, sized as a ~30 cm ball would look at that distance. */
+function drawOrb({ pin, rel, p, isT }, F, t) {
+  const rgb = isT ? RGB.cyan : RGB.green;
+  const pulse = isT ? 1 + 0.08 * Math.sin(t * 4) : 1;
+  const r = G.clamp((F * 0.15) / Math.max(p.dist, 0.3), 5, 24) * pulse; // capped: up close a true-size ball would fill the display
+  glow(p.x, p.y, r, rgb);
+  const u = S.settings.units, lvl = levelText(pin, rel);
+  const label = rel.flat < 3 && !lvl ? pin.name : `${pin.name} · ${G.fmtDist(rel.flat, u)}${lvl ? " " + lvl : ""}`;
+  placeLabel(label, p.x, p.y - r * 1.6 - 14, { size: isT ? 22 : 18, color: WHITE, weight: 700 });
 }
 
-function drawEdge({ pin, rel, p }, isT) {
-  const th = p.angle;
-  const bottom = S.target ? 455 : 520; // stay clear of the guidance text
-  const cx = CX, cy = (70 + bottom) / 2, hw = W / 2 - 34, hh = (bottom - 70) / 2;
-  const t = Math.min(hw / Math.abs(Math.cos(th) || 1e-9), hh / Math.abs(Math.sin(th) || 1e-9));
-  const x = cx + t * Math.cos(th), y = cy + t * Math.sin(th);
-  const s = isT ? 16 : 9;
-  ctx.save(); ctx.translate(x, y); ctx.rotate(th);
-  ctx.fillStyle = isT ? CYAN : GREEN;
-  ctx.beginPath(); ctx.moveTo(s, 0); ctx.lineTo(-s, -s * 0.8); ctx.lineTo(-s * 0.4, 0); ctx.lineTo(-s, s * 0.8); ctx.closePath(); ctx.fill();
-  ctx.restore();
+function glow(x, y, r, rgb, strength = 1) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r * 3);
+  g.addColorStop(0, `rgba(255,255,255,${strength})`);
+  g.addColorStop(0.2, `rgba(${rgb},${strength})`);
+  g.addColorStop(0.45, `rgba(${rgb},${0.35 * strength})`);
+  g.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, r * 3, 0, Math.PI * 2); ctx.fill();
 }
 
-function drawGuide({ pin, rel, p }, heading) {
-  const u = S.settings.units;
-  const lvl = levelText(pin, rel);
-  const sameLevel = !lvl;
-  let line2;
-  if (rel.flat < Math.max(4, Math.min(RT.filter.sigma, 15)) && sameLevel) line2 = "You're here";
-  else {
-    const turn = G.wrap180(G.bearingOf(rel.e, rel.n) - heading);
-    const onScreen = p.z > 0.02 && p.x > 0 && p.x < W && p.y > 50 && p.y < H - 40;
-    if (rel.flat >= 3 && Math.abs(turn) > 20) line2 = `Turn ${turn > 0 ? "right" : "left"} ${Math.round(Math.abs(turn))}°`;
-    else if (onScreen) line2 = "Right there";
-    else {
-      const elev = Math.atan2(rel.up, rel.flat) * G.R2D;
-      line2 = elev < RT.pose.pitch ? "Look down" : "Look up";
-    }
+/** Off the display: behind you → arrow at the bottom pointing down; to a side → arrow on that side;
+ *  roughly ahead but above/below → arrow up/down. */
+function drawOffscreen({ pin, rel, orb, p, isT }, heading, pitch) {
+  const rgb = isT ? RGB.cyan : RGB.green, col = isT ? CYAN : GREEN;
+  const turn = rel.flat < 0.5 ? 0 : G.wrap180(G.bearingOf(rel.e, rel.n) - heading);
+  const elev = Math.atan2(orb.up, Math.max(rel.flat, 0.01)) * G.R2D;
+  let x, y, ang, note;
+  // Straight above/below you (e.g. floor 20 over the lobby): an up/down arrow, not a side arrow.
+  const overhead = rel.flat < 0.5 || (p.z <= 0.02 && Math.abs(turn) <= 45);
+  if (!overhead && Math.abs(turn) > 135) { x = CX; y = 372; ang = Math.PI / 2; note = "Behind you"; }
+  else if (!overhead && !(p.z > 0.02 && p.x >= 0 && p.x <= W)) { // off to a side of the display
+    const right = p.z > 0.02 ? p.x > CX : turn > 0;
+    x = right ? W - 34 : 34; y = G.clamp(CY - (elev - pitch) * 6, 130, 380); ang = right ? 0 : Math.PI;
+    note = `${right ? "Right" : "Left"} ${Math.round(Math.abs(turn))}°`;
+  } else {
+    const below = elev < pitch;
+    x = G.clamp(CX + turn * 20, 60, W - 60); y = below ? 372 : 120; ang = below ? Math.PI / 2 : -Math.PI / 2;
+    note = below ? "Look down" : "Look up";
   }
-  text(`${pin.name} · ${G.fmtDist(rel.flat, u)}${lvl ? " · " + lvl : ""}`, CX, 522, { size: 22, color: CYAN, weight: 700 });
-  text(line2, CX, 496, { size: 20, color: WHITE, weight: 600 });
+  const s = isT ? 22 : 12;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(ang);
+  ctx.shadowColor = `rgba(${rgb},0.9)`; ctx.shadowBlur = isT ? 18 : 8;
+  ctx.fillStyle = col;
+  ctx.beginPath(); ctx.moveTo(s, 0); ctx.lineTo(-s, -s * 0.85); ctx.lineTo(-s * 0.35, 0); ctx.lineTo(-s, s * 0.85); ctx.closePath(); ctx.fill();
+  ctx.restore();
+  if (isT) {
+    const ty = ang === Math.PI / 2 ? y - 40 : ang === -Math.PI / 2 ? y + 40 : y + 36;
+    const tx = G.clamp(x, 90, W - 90);
+    text(note, tx, ty, { size: 20, color: WHITE, weight: 700 });
+  }
+}
+
+/** Standing on a pin: a glowing spot under you. */
+function drawArrived({ pin, isT }, t) {
+  const rgb = isT ? RGB.cyan : RGB.green;
+  const r = 26 * (1 + 0.12 * Math.sin(t * 5));
+  ctx.save(); ctx.translate(CX, 422); ctx.scale(1, 0.4);
+  glow(0, 0, r, rgb, 0.9);
+  ctx.restore();
+  text(`At ${pin.name}`, CX, 446, { size: 16, color: WHITE, weight: 700 });
+}
+
+/**
+ * Tilted mini map (like car navigation): you in the middle, the way you face is up, a cone for
+ * what you're looking at, pins as glowing dots. Zooms so the pin you're guided to fits.
+ */
+const MM = { x: 112, y: 505, r: 92, tilt: 0.55 };
+function drawMiniMap(heading, items) {
+  const me = here();
+  const target = items.find((i) => i.isT) || (items.length ? items.reduce((a, b) => (a.rel.flat < b.rel.flat ? a : b)) : null);
+  const want = target ? target.rel.flat * 1.35 : 40;
+  const radiusM = [15, 25, 40, 60, 100, 150, 250, 400, 800].find((r) => r >= want) || 800; // steps, so the map doesn't keep re-zooming
+  const pxPerM = MM.r / radiusM;
+  const h = heading * G.D2R, cosH = Math.cos(h), sinH = Math.sin(h);
+  const toMap = (e, n) => { // metres east/north → mini-map pixels (before tilt)
+    const fwd = e * sinH + n * cosH, rgt = e * cosH - n * sinH;
+    return { x: rgt * pxPerM, y: -fwd * pxPerM };
+  };
+  ctx.save();
+  ctx.translate(MM.x, MM.y);
+  ctx.scale(1, MM.tilt);
+  ctx.beginPath(); ctx.arc(0, 0, MM.r, 0, Math.PI * 2); ctx.clip();
+  // street map underneath (dimmed), when we know where we are
+  if (me && S.work && !S.work.prov) {
+    const mpp = 1 / pxPerM;
+    const z = G.clamp(Math.floor(Math.log2((156543.03392 * Math.cos(me.lat * G.D2R)) / mpp)), 12, 19);
+    const tileM = (156543.03392 * Math.cos(me.lat * G.D2R)) / 2 ** z; // metres per tile pixel
+    const sc = tileM / mpp;
+    const c = worldPx(me.lat, me.lon, z);
+    ctx.save();
+    ctx.rotate(-h);
+    const R = MM.r / sc + 10;
+    for (let ty = Math.floor((c.y - R) / 256); ty <= Math.floor((c.y + R) / 256); ty++) {
+      for (let tx = Math.floor((c.x - R) / 256); tx <= Math.floor((c.x + R) / 256); tx++) {
+        const tl = tile(z, tx, ty);
+        if (!tl) continue;
+        ctx.globalAlpha = tl.dim ? 0.3 : 0.9;
+        ctx.drawImage(tl.ready, (tx * 256 - c.x) * sc, (ty * 256 - c.y) * sc, 256 * sc, 256 * sc);
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+  // view cone (what's in front of you)
+  const cone = ctx.createRadialGradient(0, 0, 0, 0, 0, MM.r);
+  cone.addColorStop(0, "rgba(51,221,255,0.45)");
+  cone.addColorStop(1, "rgba(51,221,255,0)");
+  ctx.fillStyle = cone;
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.arc(0, 0, MM.r, -Math.PI / 2 - 0.35, -Math.PI / 2 + 0.35); ctx.closePath(); ctx.fill();
+  // distance rings
+  ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(0, 0, MM.r * 0.5, 0, Math.PI * 2); ctx.stroke();
+  ctx.restore();
+  // rim
+  ctx.save(); ctx.translate(MM.x, MM.y); ctx.scale(1, MM.tilt);
+  ctx.strokeStyle = "rgba(51,221,255,0.7)"; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.arc(0, 0, MM.r, 0, Math.PI * 2); ctx.stroke();
+  ctx.restore();
+  // north marker on the rim
+  const nPos = toMap(0, radiusM * 10);
+  const nl = Math.hypot(nPos.x, nPos.y) || 1;
+  text("N", MM.x + (nPos.x / nl) * (MM.r + 12), MM.y + (nPos.y / nl) * (MM.r + 12) * MM.tilt, { size: 15, color: RED, weight: 800 });
+  // pins: glowing dots (round, drawn after the tilt so they stay round)
+  for (const it of items) {
+    let { x, y } = toMap(it.rel.e, it.rel.n);
+    const d = Math.hypot(x, y);
+    const edge = d > MM.r - 6;
+    if (edge) { x *= (MM.r - 6) / d; y *= (MM.r - 6) / d; }
+    const px = MM.x + x, py = MM.y + y * MM.tilt;
+    glow(px, py, it.isT ? 5 : 3.5, it.isT ? RGB.cyan : RGB.green, edge ? 0.6 : 1);
+    if (it.isT) text(it.pin.name, px, py - 16, { size: 14, color: WHITE, weight: 700 });
+  }
+  // you
+  ctx.fillStyle = WHITE;
+  ctx.beginPath(); ctx.moveTo(MM.x, MM.y - 11); ctx.lineTo(MM.x + 8, MM.y + 7); ctx.lineTo(MM.x, MM.y + 3); ctx.lineTo(MM.x - 8, MM.y + 7); ctx.closePath(); ctx.fill();
+  text(`${G.fmtDist(radiusM, S.settings.units)} ring`, MM.x - MM.r + 2, MM.y + MM.r * MM.tilt + 12, { size: 13, color: DIM, align: "left", weight: 600 });
+}
+
+function drawGuide({ pin, rel }, heading, pitch, arrived) {
+  const u = S.settings.units, x = 232;
+  const lvl = levelText(pin, rel);
+  let line2;
+  if (arrived) line2 = "You're here";
+  else if (rel.flat < 3 && !lvl) line2 = "Right next to you";
+  else {
+    const turn = rel.flat < 0.5 ? 0 : G.wrap180(G.bearingOf(rel.e, rel.n) - heading);
+    if (Math.abs(turn) > 135) line2 = "Turn around";
+    else if (Math.abs(turn) > 12) line2 = `Turn ${turn > 0 ? "right" : "left"} ${Math.round(Math.abs(turn))}°`;
+    else line2 = lvl ? (lvl.startsWith("↓") ? "Ahead, below you" : "Ahead, above you") : "Straight ahead";
+  }
+  text(pin.name, x, 470, { size: 22, color: pin.id === S.target ? CYAN : GREEN, align: "left", weight: 700 });
+  text(`${G.fmtDist(rel.flat, u)}${lvl ? " · " + lvl : ""}`, x, 498, { size: 20, color: WHITE, align: "left", weight: 600 });
+  text(line2, x, 526, { size: 20, color: WHITE, align: "left", weight: 600 });
 }
 
 function drawStatus() {
   const s = S.settings;
-  const left = s.heightMode === "altitude" && RT.alt != null ? `Alt ${G.fmtDist(RT.alt, s.units)}` : `Floor ${S.floor}`;
+  const floor = s.heightMode === "altitude" && RT.alt != null ? `Alt ${G.fmtDist(RT.alt, s.units)}` : `Floor ${S.floor}`;
   const f = RT.filter;
-  const mid = !S.work ? (RT.geoErr ? "No location" : "Finding you…") : S.work.prov ? "Steps only" : `±${G.fmtDist(f.sigma, s.units)}`;
-  text(left, 24, 572, { size: 18, color: DIM, align: "left", weight: 600 });
-  text(mid, CX, 572, { size: 18, color: f.sigma > 25 ? RED : DIM, weight: 600 });
-  text(`${S.pins.length} pin${S.pins.length === 1 ? "" : "s"}`, W - 24, 572, { size: 18, color: DIM, align: "right", weight: 600 });
+  const where = !S.work ? (RT.geoErr ? "no location" : "finding you…") : S.work.prov ? "steps only" : `±${G.fmtDist(f.sigma, s.units)}`;
+  const north = s.autoAlign && RT.aligner.ready ? "N ✓" : "N ~";
+  text(`${floor} · ${where} · ${north}`, W - 16, 580, { size: 16, color: f.sigma > 25 ? RED : DIM, align: "right", weight: 600 });
 }
 
 // ---------- map (OpenStreetMap, dimmed so it doesn't block your view) ----------
@@ -877,10 +1115,11 @@ function tile(z, x, y) {
   if (y < 0 || y >= n) return null;
   const key = `${z}/${x}/${y}`;
   let t = tiles.get(key);
+  if (t && t.failedAt && performance.now() - t.failedAt > 30000) { tiles.delete(key); t = null; } // retry after 30 s
   if (!t) {
-    t = { ready: null, dim: false };
+    t = { ready: null, dim: false, failedAt: 0 };
     const img = new Image();
-    img.onerror = () => tiles.delete(key); // try again next time it's needed
+    img.onerror = () => { t.failedAt = performance.now(); }; // no internet: don't hammer the server every frame
     img.onload = () => {
       // Darken once here (black = see-through on the glasses), not on every frame.
       const cv = document.createElement("canvas");
@@ -940,6 +1179,9 @@ function drawMap() {
   const mPerPx = (156543.03392 * Math.cos(me.lat * G.D2R)) / 2 ** z;
   ctx.strokeStyle = "rgba(51,221,255,0.5)"; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.arc(CX, CY, G.clamp(RT.filter.sigma / mPerPx, 6, 260), 0, Math.PI * 2); ctx.stroke();
+  // you (drawn first so pin labels stay readable on top)
+  ctx.fillStyle = WHITE;
+  ctx.beginPath(); ctx.moveTo(CX, CY - 14); ctx.lineTo(CX + 10, CY + 10); ctx.lineTo(CX, CY + 4); ctx.lineTo(CX - 10, CY + 10); ctx.closePath(); ctx.fill();
   // pins (positions rotated so the way you face is up; labels stay upright)
   const cosH = Math.cos(-heading * G.D2R), sinH = Math.sin(-heading * G.D2R);
   for (const pin of S.pins) {
@@ -953,9 +1195,6 @@ function drawMap() {
     ctx.beginPath(); ctx.arc(CX + x, CY + y, isT ? 9 : 7, 0, Math.PI * 2); ctx.fill();
     text(pin.name, CX + x, CY + y - 20, { size: 18, color: WHITE, weight: 700 });
   }
-  // you
-  ctx.fillStyle = WHITE;
-  ctx.beginPath(); ctx.moveTo(CX, CY - 14); ctx.lineTo(CX + 10, CY + 10); ctx.lineTo(CX, CY + 4); ctx.lineTo(CX - 10, CY + 10); ctx.closePath(); ctx.fill();
   text(`${G.cardinal(heading)} ${Math.round(heading)}°`, CX, 20, { size: 18, color: CYAN, weight: 700 });
   text("© OpenStreetMap", W - 12, 588, { size: 14, color: DIM, align: "right", weight: 500 });
   text("Swipe up/down: zoom · pinch: menu", 12, 588, { size: 14, color: DIM, align: "left", weight: 500 });

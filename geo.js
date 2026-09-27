@@ -31,7 +31,7 @@ export function bearingOf(e, n) {
   return wrap360(Math.atan2(e, n) * R2D);
 }
 
-// ---------- small vector/matrix helpers (3x3, row-major) ----------
+// ---------- small vector helpers ----------
 
 export const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 export const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
@@ -39,140 +39,11 @@ export const norm = (a) => Math.hypot(a[0], a[1], a[2]);
 export const scale = (a, k) => [a[0] * k, a[1] * k, a[2] * k];
 export const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 export const normalize = (a) => { const l = norm(a) || 1; return scale(a, 1 / l); };
-export const matT = (M) => [[M[0][0], M[1][0], M[2][0]], [M[0][1], M[1][1], M[2][1]], [M[0][2], M[1][2], M[2][2]]];
-export const matVec = (M, v) => [dot(M[0], v), dot(M[1], v), dot(M[2], v)];
-export function matMul(A, B) {
-  const Bt = matT(B);
-  return A.map((row) => Bt.map((col) => dot(row, col)));
-}
-
-/** Device -> world (x east, y north, z up) rotation, per the W3C DeviceOrientation spec (Z-X'-Y''). */
-export function rotFromEuler(alpha, beta, gamma) {
-  const x = beta * D2R, y = gamma * D2R, z = alpha * D2R;
-  const cX = Math.cos(x), cY = Math.cos(y), cZ = Math.cos(z);
-  const sX = Math.sin(x), sY = Math.sin(y), sZ = Math.sin(z);
-  return [
-    [cZ * cY - sZ * sX * sY, -cX * sZ, cY * sZ * sX + cZ * sY],
-    [cY * sZ + cZ * sX * sY, cZ * cX, sZ * sY - cZ * cY * sX],
-    [-cX * sY, sX, cX * cY],
-  ];
-}
-
-/** Snap a nearly-rotation matrix back to a true rotation (Gram-Schmidt on its columns). */
-export function orthonormalize(M) {
-  let c0 = [M[0][0], M[1][0], M[2][0]];
-  let c1 = [M[0][1], M[1][1], M[2][1]];
-  c0 = normalize(c0);
-  c1 = normalize(sub(c1, scale(c0, dot(c0, c1))));
-  const c2 = cross(c0, c1);
-  return [[c0[0], c1[0], c2[0]], [c0[1], c1[1], c2[1]], [c0[2], c1[2], c2[2]]];
-}
-
-/** Move matrix A a fraction k of the way to B, staying a rotation. Used to steady the view. */
-export function blendRot(A, B, k) {
-  if (!A) return B;
-  const M = A.map((row, i) => row.map((v, j) => v + (B[i][j] - v) * k));
-  return orthonormalize(M);
-}
-
 /** Average of angles in degrees (handles 359 and 1 correctly). */
 export function circMean(degs) {
   let s = 0, c = 0;
   for (const d of degs) { s += Math.sin(d * D2R); c += Math.cos(d * D2R); }
   return wrap360(Math.atan2(s, c) * R2D);
-}
-
-// ---------- calibration: which way the glasses face, whatever way the sensor is mounted ----------
-
-/**
- * Three captured poses (each {a, b, g} = alpha/beta/gamma in degrees, or a list of such readings):
- *   level - looking straight ahead at the horizon
- *   right - then turned to the right (about a quarter turn)
- *   down  - then looking down at your feet
- * Works out the glasses' forward/right/up directions in the sensor's own frame, and whether the
- * sensor reports alpha clockwise (a compass heading) or counter-clockwise (the web standard).
- */
-export function solveCalibration(level, right, down) {
-  const tries = [false, true].map((mirror) => solveOnce(level, right, down, mirror));
-  const good = tries.filter((t) => t.ok);
-  if (!good.length) return tries[0];
-  // The right convention is the one where turning right increases the heading.
-  const best = good.find((t) => t.turn > 30);
-  if (best) return best;
-  return { ok: false, why: "turn", turn: good[0].turn };
-}
-
-/** Average orientation of one or more readings ({a, b, g}), averaged as rotations (not angle by angle). */
-export function avgRot(readings, mirror) {
-  const list = Array.isArray(readings) ? readings : [readings];
-  const m = mirror ? -1 : 1;
-  const sum = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-  for (const r of list) {
-    const R = rotFromEuler(m * r.a, r.b, r.g);
-    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) sum[i][j] += R[i][j];
-  }
-  return orthonormalize(sum);
-}
-
-function solveOnce(level, right, down, mirror) {
-  const R1 = avgRot(level, mirror);
-  const R2 = avgRot(right, mirror);
-  const R3 = avgRot(down, mirror);
-  const up = normalize(matVec(matT(R1), [0, 0, 1])); // world up, seen from the sensor, head level
-  const Q = matMul(matT(R1), R3); // the head's nod, in the sensor's frame
-  const cosAng = clamp((Q[0][0] + Q[1][1] + Q[2][2] - 1) / 2, -1, 1);
-  const downAngle = Math.acos(cosAng) * R2D;
-  if (downAngle < 20) return { ok: false, why: "down", downAngle };
-  let axis = [Q[2][1] - Q[1][2], Q[0][2] - Q[2][0], Q[1][0] - Q[0][1]];
-  axis = sub(axis, scale(up, dot(axis, up)));
-  if (norm(axis) < 1e-6) return { ok: false, why: "down", downAngle };
-  axis = normalize(axis);
-  let fwd = normalize(cross(up, axis));
-  // Forward must drop when you look down.
-  if (matVec(R3, fwd)[2] > matVec(R1, fwd)[2]) fwd = scale(fwd, -1);
-  const rgt = normalize(cross(fwd, up));
-  const cal = { ok: true, mirror, fwd, right: rgt, up: cross(rgt, fwd), downAngle, offset: 0 };
-  const h1 = headPose(R1, cal).heading, h2 = headPose(R2, cal).heading;
-  cal.turn = wrap180(h2 - h1);
-  return cal;
-}
-
-/** Rotation for a raw orientation reading, honouring the calibration's alpha direction. */
-export function rotForReading(a, b, g, cal) {
-  return rotFromEuler(cal && cal.mirror ? -a : a, b, g);
-}
-
-/** Heading (true, 0-360 clockwise from north, incl. the user's offset) and pitch (up +) of the glasses. */
-export function headPose(R, cal) {
-  const f = matVec(R, cal.fwd);
-  const flat = Math.hypot(f[0], f[1]);
-  const heading = wrap360(Math.atan2(f[0], f[1]) * R2D + (cal.offset || 0));
-  const pitch = Math.atan2(f[2], flat) * R2D;
-  const r = matVec(R, cal.right);
-  const roll = Math.asin(clamp(-r[2], -1, 1)) * R2D;
-  return { heading, pitch, roll, flat };
-}
-
-/**
- * Where a spot appears on the display.
- * rel: {e, n, up} metres from your eyes (true north). Returns screen x/y, depth z (> 0 = in front),
- * and the direction to it on the screen for edge arrows.
- */
-export function project(R, cal, rel, focal, cx, cy) {
-  // Turn true north into the sensor's north (undo the heading offset).
-  const o = -(cal.offset || 0) * D2R;
-  const e = rel.e * Math.cos(o) + rel.n * Math.sin(o);
-  const n = -rel.e * Math.sin(o) + rel.n * Math.cos(o);
-  const world = [e, n, rel.up];
-  const dist = norm(world);
-  const d = matVec(matT(R), scale(world, 1 / (dist || 1)));
-  const x = dot(d, cal.right), y = dot(d, cal.up), z = dot(d, cal.fwd);
-  const out = { x: NaN, y: NaN, z, dist, angle: Math.atan2(-y, x) };
-  if (z > 0.02) {
-    out.x = cx + (x / z) * focal;
-    out.y = cy - (y / z) * focal;
-  }
-  return out;
 }
 
 // ---------- position: GPS + step counting ----------
@@ -249,4 +120,88 @@ export function fmtDist(m, units) {
 
 export function cardinal(deg) {
   return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(wrap360(deg) / 45) % 8];
+}
+
+// ---------- v3: trust the glasses' own compass heading ----------
+// Meta's docs: alpha is the compass heading (0 = north), beta tilt, gamma roll. Calibration only
+// learns which way each reading turns: turning right must raise the heading, looking down must lower
+// the pitch. No 3D reconstruction from angles (that's what made v1/v2 drift).
+
+/** Mean of a list of readings ({a, b, g}), each angle averaged on the circle. */
+export function meanReading(list) {
+  const arr = Array.isArray(list) ? list : [list];
+  return {
+    a: circMean(arr.map((r) => r.a)),
+    b: wrap180(circMean(arr.map((r) => r.b))),
+    g: wrap180(circMean(arr.map((r) => r.g))),
+  };
+}
+
+/** level / right / down: readings (or lists) looking level, then turned right, then looking down. */
+export function solveSimpleCal(level, right, down) {
+  const L = meanReading(level), Rr = meanReading(right), D = meanReading(down);
+  const turn = wrap180(Rr.a - L.a);
+  if (Math.abs(turn) < 30) return { ok: false, why: "turn", turn };
+  const db = wrap180(D.b - L.b), dg = wrap180(D.g - L.g);
+  const pAxis = Math.abs(db) >= Math.abs(dg) ? "b" : "g";
+  const d = pAxis === "b" ? db : dg;
+  if (Math.abs(d) < 20) return { ok: false, why: "down", d };
+  return { ok: true, kind: "simple", hSign: turn > 0 ? 1 : -1, pAxis, pSign: d < 0 ? 1 : -1, pZero: L[pAxis], turn, down: d };
+}
+
+/** Heading (0-360 clockwise, as the glasses' compass reports it) and pitch (up +) from one reading. */
+export function readPose(r, cal) {
+  return { heading: wrap360(cal.hSign * r.a), pitch: cal.pSign * wrap180(r[cal.pAxis] - cal.pZero) };
+}
+
+/**
+ * Where a spot appears on the display for a head at (heading, pitch).
+ * rel: {e, n, up} metres from your eyes, true north. Returns screen x/y (NaN if behind) and depth z.
+ */
+export function projectHP(heading, pitch, rel, focal, cx, cy) {
+  const h = heading * D2R, p = pitch * D2R;
+  const f = [Math.cos(p) * Math.sin(h), Math.cos(p) * Math.cos(h), Math.sin(p)];
+  const r = [Math.cos(h), -Math.sin(h), 0];
+  const u = cross(r, f);
+  const w = [rel.e, rel.n, rel.up];
+  const dist = norm(w);
+  const d = scale(w, 1 / (dist || 1));
+  const x = dot(d, r), y = dot(d, u), z = dot(d, f);
+  const out = { x: NaN, y: NaN, z, dist };
+  if (z > 0.02) { out.x = cx + (x / z) * focal; out.y = cy - (y / z) * focal; }
+  return out;
+}
+
+/** Running average of angles (degrees) that follows slowly: k per update (0-1). */
+export class AngleAvg {
+  constructor(k) { this.k = k; this.c = null; this.s = null; }
+  push(deg) {
+    const c = Math.cos(deg * D2R), s = Math.sin(deg * D2R);
+    if (this.c === null) { this.c = c; this.s = s; } else { this.c += (c - this.c) * this.k; this.s += (s - this.s) * this.k; }
+    return this.value;
+  }
+  get value() { return this.c === null ? null : wrap360(Math.atan2(this.s, this.c) * R2D); }
+  get steadiness() { return this.c === null ? 0 : Math.hypot(this.c, this.s); }
+}
+
+/**
+ * Learns the fixed difference between where the glasses say they point and true north, from walking:
+ * GPS says which way you're moving; while you walk looking ahead, that's where your head points.
+ */
+export class HeadingAligner {
+  constructor(state) { Object.assign(this, { sx: 0, sy: 0, n: 0, value: null }, state || {}); }
+  /** course: GPS direction of travel; head: glasses' heading (uncorrected). Returns true when updated. */
+  add(course, head) {
+    const d = wrap180(course - head) * D2R;
+    const decay = this.n >= 40 ? 0.975 : 1; // keep adapting slowly once well learned
+    this.sx = this.sx * decay + Math.cos(d);
+    this.sy = this.sy * decay + Math.sin(d);
+    this.n = Math.min(this.n + 1, 40);
+    const len = Math.hypot(this.sx, this.sy);
+    const R = len / this.n; // resultant length per sample (1 = perfectly consistent); weights sum to n even with decay
+    if (this.n >= 6 && R > 0.8) { this.value = wrap180(Math.atan2(this.sy, this.sx) * R2D); return true; }
+    return false;
+  }
+  get ready() { return this.value !== null; }
+  toJSON() { return { sx: this.sx, sy: this.sy, n: this.n, value: this.value, decl: this.decl }; }
 }
