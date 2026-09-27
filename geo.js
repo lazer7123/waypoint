@@ -48,41 +48,6 @@ export function circMean(degs) {
 
 // ---------- position: GPS + step counting ----------
 
-/**
- * Your position in metres (east/north of a working origin), blending steps and GPS.
- * Steps keep it steady indoors and between fixes; GPS pulls it back when it's good.
- */
-export class PosFilter {
-  constructor() { this.e = 0; this.n = 0; this.P = 1e8; this.has = false; }
-  get sigma() { return Math.sqrt(this.P); }
-  /** Time passing adds doubt (q in m2 per second): you may have moved without us seeing it. */
-  predict(dtSec, q) {
-    if (dtSec > 0) this.P += q * Math.min(dtSec, 600);
-  }
-  step(len, headingDeg) {
-    const h = headingDeg * D2R;
-    this.e += len * Math.sin(h);
-    this.n += len * Math.cos(h);
-    this.P += 0.3 * 0.3 + (len * 0.12) ** 2;
-  }
-  /** A GPS fix at (e, n) with accuracy acc metres. Returns 'first', 'reset' or 'blend'. */
-  fix(e, n, acc) {
-    // Phones report accuracy conservatively; ~0.6x is closer to the typical error of one fix.
-    const Rv = (0.6 * Math.max(acc, 3)) ** 2;
-    if (!this.has) { this.e = e; this.n = n; this.P = Rv; this.has = true; return "first"; }
-    const dx = e - this.e, dy = n - this.n;
-    if (Math.hypot(dx, dy) > 3 * Math.sqrt(this.P + Rv) && acc <= 20) {
-      this.e = e; this.n = n; this.P = Rv; return "reset";
-    }
-    const K = this.P / (this.P + Rv);
-    this.e += K * dx; this.n += K * dy;
-    // GPS errors drift together from one fix to the next, so many fixes are not much better than one.
-    this.P = Math.max(this.P * (1 - K), (0.4 * Math.max(acc, 3)) ** 2);
-    return "blend";
-  }
-  shift(de, dn) { this.e -= de; this.n -= dn; }
-}
-
 /** Counts steps from the bounce in the accelerometer (head-worn: a clear up-down each step). */
 export class StepDetector {
   constructor() { this.base = null; this.smooth = null; this.high = false; this.last = -1e9; this.count = 0; }
@@ -204,4 +169,123 @@ export class HeadingAligner {
   }
   get ready() { return this.value !== null; }
   toJSON() { return { sx: this.sx, sy: this.sy, n: this.n, value: this.value, decl: this.decl }; }
+}
+
+// ---------- v4: GPS-anchored position (doesn't drift away) ----------
+/**
+ * Where you are, in metres east/north of a working origin.
+ *
+ * Steps move you smoothly between GPS readings, but GPS keeps pulling you back, so errors can't
+ * pile up: walk a loop through the house and come back, and you land where GPS says the front
+ * door is — the same place the pin was dropped. (Steps alone drift forever: ~30 ft after a lap.)
+ *
+ * How hard GPS pulls follows how unsure we are: every step adds doubt (so right after walking,
+ * GPS pulls you in quickly), and standing still the readings average out (so orbs don't wobble).
+ * Indoors the phone calls its location ±30–60 m, but from moment to moment it's much steadier
+ * than that, so those readings still count.
+ */
+export class PosTracker {
+  constructor() {
+    this.e = 0; this.n = 0; this.has = false;
+    this.P = 1e8;          // uncertainty (m², each axis)
+    this.g = null;         // raw GPS averaged while standing still here (reset by any movement)
+    this.bias = null;      // how far GPS read off from a pin you re-synced at {e, n}
+    this.syncAt = null;    // the pin spot of a re-sync still waiting for GPS readings to learn that
+    this.sinceSync = 0;    // metres walked since that re-sync (the bias only holds nearby)
+    this.lastAcc = 50;
+  }
+  get sigma() { return this.has ? Math.sqrt(this.P) : 1e4; }
+  /** Honest ± to show: averaging many readings can't remove GPS's own offset indoors, unless a pin
+   *  re-sync measured it. */
+  get acc() {
+    if (!this.has) return 1e4;
+    const floor = this.bias && this.biasFade > 0 ? 0 : Math.min(0.15 * this.lastAcc, 10);
+    return Math.hypot(Math.sqrt(this.P), floor);
+  }
+  /** Time passing without steps being counted (q in m² per second). */
+  predict(dtSec, q) { if (dtSec > 0) this.P += q * Math.min(dtSec, 600); }
+  /**
+   * Some movement was felt (a bounce, a shuffle): GPS read before it isn't "standing here".
+   * walked = metres to count toward fading a re-sync correction, when steps aren't being counted.
+   * Several bounces right after a re-sync mean you've walked off: stop waiting to compare GPS there.
+   */
+  moving(walked = 0) {
+    this.g = null;
+    if (walked > 0) this.sinceSync += walked;
+    if (this.syncAt && ++this.syncAt.bounces > 3) this.syncAt = null;
+  }
+  step(len, headingDeg) {
+    const h = headingDeg * D2R;
+    this.e += len * Math.sin(h);
+    this.n += len * Math.cos(h);
+    this.sinceSync += len;
+    this.g = null;
+    this.syncAt = null;  // walked off before GPS could be compared with the pin
+    // Step errors don't average out: a whole hallway walked 15° off (head vs feet) or with short
+    // steps is off the same way every step, so doubt grows fast (~0.6 m per metre-step).
+    this.P += (0.6 * len) ** 2;
+  }
+  /** How much of the re-sync GPS correction still applies: all of it around the building (25 m of
+   *  walking), then fading out by 80 m, where GPS errors are different anyway. */
+  get biasFade() { return this.bias ? clamp(1 - (this.sinceSync - 25) / 55, 0, 1) : 0; }
+  /**
+   * A GPS reading at (e, n); acc = the phone's accuracy estimate; strong = trust GPS more
+   * (outdoors, open sky). Returns "first" | "snap" | "blend" | "skip".
+   */
+  fix(e, n, acc, strong = false) {
+    if (!Number.isFinite(e) || !Number.isFinite(n)) return "skip";
+    const a = Math.max(Number.isFinite(acc) ? acc : 50, 3);
+    // A cell-tower / Wi-Fi guess (±150 m or worse) says nothing useful once we know roughly where
+    // we are (but it's still better than nothing after reopening somewhere else).
+    if (this.has && a > 150 && Math.sqrt(this.P) < 0.3 * a) return "skip";
+    this.lastAcc = Math.min(a, 150);
+    // Standing-still average of the raw readings (for re-sync). A reading far from it means we moved.
+    if (this.g && this.g.k >= 3 && Math.hypot(e - this.g.e, n - this.g.n) > Math.max(12, 0.4 * a)) this.g = null;
+    const k = this.g ? Math.min(this.g.k + 1, 10) : 1;
+    this.g = this.g ? { e: this.g.e + (e - this.g.e) / k, n: this.g.n + (n - this.g.n) / k, k } : { e, n, k: 1 };
+    if (this.syncAt) {
+      if (this.g.k >= 3) this.learnBias();
+      else if (++this.syncAt.fixes > 8) this.syncAt = null;  // never stood still long enough
+    }
+    const f = this.biasFade;
+    if (f > 0) { e -= this.bias.e * f; n -= this.bias.n * f; }
+    // Moment-to-moment noise of phone location is about a fifth of what it reports indoors;
+    // beyond ±80 m it's a rough guess, weighted as such.
+    const R = a > 80 ? (0.3 * a) ** 2 : strong ? clamp((0.1 * a) ** 2, 1, 36) : clamp((0.2 * a) ** 2, 4, 100);
+    if (!this.has) {
+      this.e = e; this.n = n; this.P = R; this.has = true;
+      return "first";
+    }
+    const dist = Math.hypot(e - this.e, n - this.n);
+    if (a <= 15 && dist > Math.max(12, 3 * a) && dist > 3 * Math.sqrt(this.P + R)) {
+      this.e = e; this.n = n; this.P = R; this.bias = null; this.syncAt = null;  // a good reading far away: we were wrong
+      return "snap";
+    }
+    const K = this.P / (this.P + R);
+    this.e += K * (e - this.e);
+    this.n += K * (n - this.n);
+    this.P = Math.max(this.P * (1 - K), 0.5);
+    return "blend";
+  }
+  /**
+   * You're standing exactly at a known spot (a pin): jump there, drift gone. Once GPS has been read
+   * a few times standing here (before or just after), remember how far off it is here, and correct
+   * it by that much nearby, so it doesn't pull you away from the pin again as you walk around.
+   */
+  resync(e, n) {
+    this.e = e; this.n = n; this.P = 0.5; this.has = true; this.sinceSync = 0;
+    this.bias = null;
+    this.syncAt = { e, n, fixes: 0, bounces: 0 };
+    if (this.g && this.g.k >= 3) this.learnBias();
+  }
+  learnBias() {
+    const be = this.g.e - this.syncAt.e, bn = this.g.n - this.syncAt.n;
+    this.bias = Math.hypot(be, bn) <= 60 ? { e: be, n: bn } : null;
+    this.syncAt = null;
+  }
+  shift(de, dn) {
+    this.e -= de; this.n -= dn;
+    if (this.g) { this.g.e -= de; this.g.n -= dn; }
+    if (this.syncAt) { this.syncAt.e -= de; this.syncAt.n -= dn; }
+  }
 }

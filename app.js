@@ -13,7 +13,7 @@ const DEFAULTS = {
   steps: true,          // count steps to track you indoors / between GPS fixes
   stepLen: 0.7,         // metres per step
   stepSens: 1.2,        // m/s2 bounce that counts as a step
-  gps: "auto",          // auto (ignore poor indoor fixes) | always | off
+  gps: "auto",          // auto (steps + GPS) | always (GPS pulls hard: outdoors) | off (steps only)
   fov: 14,              // degrees across the display (for lining pins up with the world)
   offset: 0,            // extra heading trim, degrees
   north: "magnetic",    // what the glasses' compass reports: magnetic (we add the local declination) | true
@@ -35,7 +35,7 @@ const RT = {
   head: new G.AngleAvg(0.3), headSlow: new G.AngleAvg(0.03), pitch: null, aligner: new G.HeadingAligner(), courseFrom: null, courseHead: null,
   orientCount: 0, orientRate: 0,
   pose: null, walkHeading: null,
-  steps: new G.StepDetector(), filter: new G.PosFilter(), accel: NaN,
+  steps: new G.StepDetector(), filter: new G.PosTracker(), accel: NaN,
   fix: null, fixes: 0, gpsConfirmed: false, lastStepT: -1e9, lastCand: -1e9, streak: 0, walkSteps: 0, yawRate: 0, prevH: null, prevHT: 0,
   sawAbs: false, lastOrientT: -1e9, decl: 0, declAt: null, home: "ar", hist: 0, pendingGo: 0, navigating: false, frameErr: null, alt: null, geoErr: null, geoStarted: false,
   toastUntil: 0, confirm: null, calStep: 0, calCaps: [], calMsg: "",
@@ -90,7 +90,14 @@ function load() {
     // Last known spot. If it's more than a couple of minutes old you may be anywhere now: trust the
     // first GPS fix of this session completely, however rough it is.
     f.has = true;
-    f.P = Date.now() - (S.posT || 0) < 120000 ? 30 * 30 : 1e8;
+    const age = Date.now() - (S.posT || 0);
+    f.P = age < 120000 ? 30 * 30 : 1e8;
+    // A pin re-sync's GPS correction still holds if it's recent (GPS errors change over the day).
+    if (Number.isFinite(S.pos.lastAcc)) f.lastAcc = G.clamp(S.pos.lastAcc, 3, 150);
+    const b = S.pos.bias;
+    if (age < 600000 && b && Number.isFinite(b.e) && Number.isFinite(b.n) && Number.isFinite(S.pos.since)) {
+      f.bias = { e: b.e, n: b.n }; f.sinceSync = Math.max(0, S.pos.since);
+    }
   }
 }
 function cleanSettings(raw) {
@@ -110,7 +117,8 @@ function validCal(c) {
 }
 
 function save() {
-  S.pos = { e: RT.filter.e, n: RT.filter.n };
+  const f = RT.filter;
+  S.pos = { e: f.e, n: f.n, lastAcc: f.lastAcc, ...(f.biasFade > 0 ? { bias: f.bias, since: f.sinceSync } : {}) };
   if (RT.gpsConfirmed) S.posT = Date.now(); // only a position GPS has confirmed this session counts as fresh
   S.align = RT.aligner.toJSON();
   try { localStorage.setItem(STORE, JSON.stringify(S)); } catch { /* ignore */ }
@@ -158,8 +166,12 @@ window.addEventListener("devicemotion", (ev) => {
   if (!a || a.x == null) return;
   const mag = Math.hypot(a.x, a.y || 0, a.z || 0);
   RT.accel = mag;
+  RT.motionSeen = true;
   const now = performance.now();
   if (!RT.steps.push(mag, now, S.settings.stepSens)) return;
+  // Any bounce: GPS read before it no longer counts as "standing here". (With step counting off,
+  // bounces are the only sign of how far you've walked from a re-sync.)
+  RT.filter.moving(S.settings.steps ? 0 : S.settings.stepLen);
   // A nod or head turn also bounces the sensor. Count it as walking only with a steady rhythm
   // (3+ bounces 0.3-1.2 s apart) and while not whipping your head around.
   const gap = now - RT.lastCand;
@@ -194,13 +206,18 @@ function onFix(p) {
   learnAlignment(RT.fix);
   if (Number.isFinite(c.altitude)) RT.alt = RT.alt == null ? c.altitude : RT.alt + (c.altitude - RT.alt) * 0.3;
   const f = RT.filter, mode = S.settings.gps, acc = RT.fix.acc;
-  if (mode === "off" && f.has) return;
-  // Indoors GPS is often 30-60 m off; steps are better there. Take a poor fix only if we know even less.
-  if (mode === "auto" && f.has && acc > 25 && acc >= f.sigma) return;
+  if (mode === "off" && f.has) {
+    // Steps only, but still tie steps-only pins to the map the first time GPS is heard.
+    if (S.work && S.work.prov) { anchor(RT.fix); afterMove(); }
+    return;
+  }
+  // Every reading counts, even indoors at ±30-60 m: from moment to moment it's much steadier than
+  // that, so it keeps pulling you back and step errors can't pile up. How hard it pulls follows how
+  // unsure we are (see PosTracker).
   anchor(RT.fix);
   const z = G.enu(S.work.lat, S.work.lon, RT.fix.lat, RT.fix.lon);
   predict();
-  f.fix(z.e, z.n, acc);
+  if (f.fix(z.e, z.n, acc, mode === "always") === "skip") return;
   RT.gpsConfirmed = true;
   afterMove();
 }
@@ -256,12 +273,14 @@ function headingCorrection() {
   return base + s.offset;
 }
 
-/** Grow position doubt with time. Walking with steps counted: steps carry the movement.
- *  No steps lately: probably standing still, a little doubt. Step tracking off: you could be walking. */
+/** Grow position doubt with time. Walking with steps counted: steps carry the movement. Head
+ *  perfectly still: standing, very little doubt (orbs stay put). Bouncing without a clear step
+ *  rhythm (shuffling) or no motion sensor: more. Step tracking off: you could be walking. */
 let lastPredict = performance.now();
 function predict() {
   const now = performance.now();
-  const q = !S.settings.steps ? 3 : now - RT.lastStepT < 3000 ? 0.05 : 0.5;
+  const q = !S.settings.steps ? 3 : now - RT.lastStepT < 3000 ? 0.05
+    : !RT.motionSeen ? 0.5 : now - RT.lastCand < 2500 ? 1 : 0.05;
   RT.filter.predict((now - lastPredict) / 1000, q);
   lastPredict = now;
 }
@@ -345,20 +364,44 @@ function dropPin(name, ahead = 0) {
     me = G.offsetLatLon(me.lat, me.lon, ahead * Math.sin(h), ahead * Math.cos(h));
   }
   const pin = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5), name, lat: me.lat, lon: me.lon,
-                floor: S.floor, alt: RT.alt, acc: RT.filter.sigma, t: Date.now() };
+                floor: S.floor, alt: RT.alt, acc: RT.filter.acc, t: Date.now() };
   if (S.work.prov) pin.prov = true;
   S.pins.push(pin);
   save();
-  toast(`Dropped ${name} · floor ${S.floor}${pin.prov ? " · no GPS yet, using steps" : RT.filter.sigma > 25 ? " · rough spot" : ""}`);
+  toast(`Dropped ${name} · floor ${S.floor}${pin.prov ? " · no GPS yet, using steps" : RT.filter.acc > 25 ? " · rough spot" : ""}`);
 }
 
 function movePinHere(pin) {
   if (!S.work) S.work = { lat: 0, lon: 0, prov: true };
   const me = here();
-  pin.lat = me.lat; pin.lon = me.lon; pin.floor = S.floor; pin.alt = RT.alt; pin.acc = RT.filter.sigma; pin.t = Date.now();
+  pin.lat = me.lat; pin.lon = me.lon; pin.floor = S.floor; pin.alt = RT.alt; pin.acc = RT.filter.acc; pin.t = Date.now();
   if (S.work.prov) pin.prov = true; else delete pin.prov;
   save();
   toast(`Moved ${pin.name} here`);
+}
+
+/** "I'm at this pin": you know exactly where you are, so jump there and clear all drift. */
+function resyncAt(pin) {
+  if (!S.work || !S.pins.includes(pin)) return;
+  const z = G.enu(S.work.lat, S.work.lon, pin.lat, pin.lon);
+  RT.filter.resync(z.e, z.n);
+  S.floor = pin.floor;
+  save();
+  const b = RT.filter.bias, off = b ? Math.hypot(b.e, b.n) : 0;
+  const note = b ? (off >= 3 ? ` · GPS was ${G.fmtDist(off, S.settings.units)} off here` : "") : !S.work.prov && S.settings.gps !== "off" ? " · hold still a few seconds" : "";
+  toast(`Re-synced at ${pin.name} · floor ${pin.floor}${note}`, 3000);
+}
+
+/** The pin you're probably standing at (for the quick re-sync), if one is close. */
+function nearPin() {
+  let best = null;
+  for (const p of S.pins) {
+    const rel = relOf(p);
+    if (!rel) continue;
+    const d = rel.flat + Math.abs(p.floor - S.floor) * 3;
+    if (d <= Math.max(8, Math.min(RT.filter.acc * 1.5, 20)) && (!best || d < best.d)) best = { p, d };
+  }
+  return best ? best.p : null;
 }
 
 function deletePin(pin) {
@@ -555,7 +598,11 @@ const setFloor = (f) => { S.floor = G.clamp(Math.round(f), -9, 200); save(); };
 const cycle = (arr, v, dir) => arr[(arr.indexOf(v) + dir + arr.length) % arr.length];
 const fmtFloorH = () => S.settings.units === "ft" ? `${(S.settings.floorH * 3.28084).toFixed(1)} ft` : `${S.settings.floorH.toFixed(1)} m`;
 
-function mainMenu() {
+// Which pin to offer a quick re-sync for is decided once, when the menu opens, so items don't
+// jump around under your finger while you change the floor.
+function openMainMenu() { const near = nearPin(); openList(() => mainMenu(near)); }
+function mainMenu(nearAtOpen) {
+  const near = nearAtOpen && S.pins.includes(nearAtOpen) ? nearAtOpen : null;
   return {
     title: "Waypoint",
     items: [
@@ -564,6 +611,7 @@ function mainMenu() {
         ? { label: S.settings.units === "ft" ? "Drop pin 5 ft ahead" : "Drop pin 1.5 m ahead", enter: () => openList(() => dropMenu(AHEAD)) }
         : { label: "Drop ahead (needs compass)" },
       { label: "Pins", value: () => String(S.pins.length), enter: () => openList(pinsMenu) },
+      ...(near ? [{ label: `I'm at ${near.name} (re-sync)`, enter: () => { resyncAt(near); closeAll(); } }] : []),
       { label: "Floor", value: () => String(S.floor), left: () => setFloor(S.floor - 1), right: () => setFloor(S.floor + 1) },
       RT.home === "map"
         ? { label: "3D view", enter: () => { RT.home = "ar"; closeAll(); } }
@@ -584,7 +632,7 @@ function dropMenu(ahead) {
       { input: true, label: "Say or write a name…", submit: (v) => drop(uniqueName(v.slice(0, 30))) },
       ...NAMES.map((n) => ({ label: n, enter: () => drop(uniqueName(n)) })),
     ],
-    hint: RT.filter.sigma > 25 ? "Location is rough right now (weak GPS)" : "Pick a name, or pinch the top box to say one",
+    hint: RT.filter.acc > 25 ? "Location is rough right now (weak GPS)" : "Pick a name, or pinch the top box to say one",
   };
 }
 
@@ -608,11 +656,14 @@ function pinMenu(pin) {
     items: [
       guiding ? { label: "Stop guiding", enter: () => { S.target = null; save(); closeAll(); } }
               : { label: "Guide me here", enter: () => { S.target = pin.id; save(); closeAll(); toast(`Guiding to ${pin.name}`); } },
+      { label: "I'm here now (re-sync)", enter: () => { resyncAt(pin); closeAll(); } },
       { label: "Move pin to where I am", enter: () => { movePinHere(pin); goBack(); } },
       { label: confirming ? "Pinch again to delete" : "Delete", danger: true,
         enter: () => { if (confirming) { deletePin(pin); goBack(); } else { RT.confirm = `del:${pin.id}`; refreshValues(); } } },
     ],
-    hint: `Floor ${pin.floor} · ${when}${pin.prov ? " · steps only" : pin.acc > 25 ? " · rough spot" : ""}`,
+    hint: `${pin.prov ? "Not on the map yet (steps only)" : `${pin.lat.toFixed(6)}, ${pin.lon.toFixed(6)}`} · floor ${pin.floor}`
+      + `${Number.isFinite(pin.alt) ? ` · alt ${S.settings.units === "ft" ? `${Math.round(pin.alt * 3.28084)} ft` : `${Math.round(pin.alt)} m`}` : ""}`
+      + `${pin.prov ? "" : ` · ±${G.fmtDist(pin.acc, S.settings.units)}`} · ${when}`,
   };
 }
 
@@ -630,7 +681,7 @@ function settingsMenu() {
       { label: "Step tracking", value: () => (s.steps ? "on" : "off"), left: () => set("steps", !s.steps), right: () => set("steps", !s.steps) },
       { label: "Step length", value: () => (s.units === "ft" ? `${(s.stepLen * 3.28084).toFixed(1)} ft` : `${s.stepLen.toFixed(2)} m`), left: () => set("stepLen", G.clamp(+(s.stepLen - 0.05).toFixed(2), 0.4, 1.1)), right: () => set("stepLen", G.clamp(+(s.stepLen + 0.05).toFixed(2), 0.4, 1.1)) },
       { label: "Step sensitivity", value: () => s.stepSens.toFixed(1), left: () => set("stepSens", G.clamp(+(s.stepSens - 0.1).toFixed(1), 0.3, 4)), right: () => set("stepSens", G.clamp(+(s.stepSens + 0.1).toFixed(1), 0.3, 4)) },
-      { label: "GPS", value: () => ({ auto: "auto", always: "always", off: "off (indoors)" })[s.gps], left: () => set("gps", cycle(["auto", "always", "off"], s.gps, -1)), right: () => set("gps", cycle(["auto", "always", "off"], s.gps, 1)) },
+      { label: "GPS", value: () => ({ auto: "steps + GPS", always: "strong (outdoors)", off: "off (steps only)" })[s.gps], left: () => set("gps", cycle(["auto", "always", "off"], s.gps, -1)), right: () => set("gps", cycle(["auto", "always", "off"], s.gps, 1)) },
       { label: "View width", value: () => `${s.fov}°`, left: () => set("fov", G.clamp(s.fov - 1, 5, 60)), right: () => set("fov", G.clamp(s.fov + 1, 5, 60)) },
       { label: "Compass north", value: () => (s.north === "magnetic" ? `magnetic (fix ${fmtDecl()})` : "true"), left: flip("north", "magnetic", "true"), right: flip("north", "magnetic", "true") },
       { label: "Auto-align (walking)", value: () => (s.autoAlign ? (RT.aligner.ready ? `on · ${fmtAlign()}` : "on · learning") : "off"), left: () => set("autoAlign", !s.autoAlign), right: () => set("autoAlign", !s.autoAlign) },
@@ -660,7 +711,7 @@ function sensorsMenu() {
       { label: "Motion", value: () => `${fmt(RT.accel, 1)} m/s² · ${RT.walkSteps} steps (${RT.steps.count} bounces)` },
       { label: "GPS", value: () => (fix ? `±${fmt(fix.acc)} m · ${age}s ago · ${RT.fixes}` : RT.geoErr || "waiting") },
       { label: "Altitude", value: () => (fix && Number.isFinite(fix.alt) ? `${fmt(fix.alt, 1)} m ±${fmt(fix.altAcc)} (avg ${fmt(RT.alt, 1)})` : "none") },
-      { label: "My position", value: () => (S.work ? `±${fmt(f.sigma)} m${S.work.prov ? " (steps only)" : ""}` : "unknown") },
+      { label: "My position", value: () => (S.work ? `±${fmt(f.acc)} m${S.work.prov ? " (steps only)" : ""}` : "unknown") },
     ],
     hint: "Heading row: swipe sideways to match your iPhone Compass",
   };
@@ -740,7 +791,7 @@ function handleKey(k) {
       if (k === "ok") begin();
       break;
     case "ar":
-      if (k === "ok") openList(mainMenu);
+      if (k === "ok") openMainMenu();
       else if (k === "left") cycleTarget(-1);
       else if (k === "right") cycleTarget(1);
       break;
@@ -750,7 +801,7 @@ function handleKey(k) {
       else if (k === "left") cycleTarget(-1);
       else if (k === "right") cycleTarget(1);
       else if (k === "back") goBack();
-      else if (k === "ok") openList(mainMenu);
+      else if (k === "ok") openMainMenu();
       break;
     case "calib":
       if (k === "ok") captureCal();
@@ -822,7 +873,12 @@ function updatePose() {
     RT.yawRate += (Math.min(rate, 720) - RT.yawRate) * 0.3;
   }
   RT.prevH = raw; RT.prevHT = now;
-  if (Math.abs(RT.pose.pitch) < 60) RT.walkHeading = RT.pose.heading; // steady walking direction
+  // Walking direction: follows your head, but smoothed and not while it's whipping around, so a
+  // quick glance to the side doesn't send your steps that way.
+  if (Math.abs(RT.pose.pitch) < 50 && RT.yawRate < 60) {
+    const h = RT.pose.heading, w = RT.walkHeading;
+    RT.walkHeading = w == null ? h : G.wrap360(w + G.wrap180(h - w) * 0.15);
+  }
 }
 
 function frame(now) {
@@ -901,8 +957,10 @@ function drawAR() {
   }
   items.sort((a, b) => b.p.dist - a.p.dist); // far first, near on top
   let arrived = null;
+  // With a rough position, "on the pin" is a bit wider, or you'd never see it light up.
+  const arriveM = G.clamp(RT.filter.acc * 0.5, ARRIVE_M, 2.5);
   for (const it of items) {
-    if (it.rel.flat < ARRIVE_M && !levelText(it.pin, it.rel) && (!arrived || it.isT)) arrived = it;
+    if (it.rel.flat < arriveM && !levelText(it.pin, it.rel) && (!arrived || it.isT)) arrived = it;
   }
   labels = [];
   for (const it of items) {
@@ -946,6 +1004,13 @@ function drawOrb({ pin, rel, p, isT }, F, t) {
   const rgb = isT ? RGB.cyan : RGB.green;
   const pulse = isT ? 1 + 0.08 * Math.sin(t * 4) : 1;
   const r = G.clamp((F * 0.15) / Math.max(p.dist, 0.3), 5, 24) * pulse; // capped: up close a true-size ball would fill the display
+  // A faint ring: where the pin could really be, given how sure we are of our own position.
+  const spread = S.work && !S.work.prov ? RT.filter.acc : 0;
+  const ring = (F * spread) / Math.max(p.dist, 0.3);
+  if (spread >= 1.5 && ring > r * 3 && ring < 220 && (isT || rel.flat < 20)) {
+    ctx.strokeStyle = `rgba(${rgb},0.35)`; ctx.lineWidth = 2; ctx.setLineDash([6, 8]);
+    ctx.beginPath(); ctx.arc(p.x, p.y, ring, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+  }
   glow(p.x, p.y, r, rgb);
   const u = S.settings.units, lvl = levelText(pin, rel);
   const label = rel.flat < 3 && !lvl ? pin.name : `${pin.name} · ${G.fmtDist(rel.flat, u)}${lvl ? " " + lvl : ""}`;
@@ -1101,9 +1166,9 @@ function drawStatus() {
   const s = S.settings;
   const floor = s.heightMode === "altitude" && RT.alt != null ? `Alt ${G.fmtDist(RT.alt, s.units)}` : `Floor ${S.floor}`;
   const f = RT.filter;
-  const where = !S.work ? (RT.geoErr ? "no location" : "finding you…") : S.work.prov ? "steps only" : `±${G.fmtDist(f.sigma, s.units)}`;
+  const where = !S.work ? (RT.geoErr ? "no location" : "finding you…") : S.work.prov ? "steps only" : `±${G.fmtDist(f.acc, s.units)}`;
   const north = s.autoAlign && RT.aligner.ready ? "N ✓" : "N ~";
-  text(`${floor} · ${where} · ${north}`, W - 16, 580, { size: 16, color: f.sigma > 25 ? RED : DIM, align: "right", weight: 600 });
+  text(`${floor} · ${where} · ${north}`, W - 16, 580, { size: 16, color: f.acc > 25 ? RED : DIM, align: "right", weight: 600 });
 }
 
 // ---------- map (OpenStreetMap, dimmed so it doesn't block your view) ----------
@@ -1178,7 +1243,7 @@ function drawMap() {
   // accuracy circle
   const mPerPx = (156543.03392 * Math.cos(me.lat * G.D2R)) / 2 ** z;
   ctx.strokeStyle = "rgba(51,221,255,0.5)"; ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.arc(CX, CY, G.clamp(RT.filter.sigma / mPerPx, 6, 260), 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(CX, CY, G.clamp(RT.filter.acc / mPerPx, 6, 260), 0, Math.PI * 2); ctx.stroke();
   // you (drawn first so pin labels stay readable on top)
   ctx.fillStyle = WHITE;
   ctx.beginPath(); ctx.moveTo(CX, CY - 14); ctx.lineTo(CX + 10, CY + 10); ctx.lineTo(CX, CY + 4); ctx.lineTo(CX - 10, CY + 10); ctx.closePath(); ctx.fill();
@@ -1207,4 +1272,4 @@ setInterval(() => { if (RT.screen === "list" && RT.list?.def?.live) refreshValue
 requestAnimationFrame(frame);
 
 // For testing in a browser: window.__waypoint exposes state (harmless on the glasses).
-window.__waypoint = { S, RT, G, handleKey, goBack };
+window.__waypoint = { S, RT, G, handleKey, goBack, resyncAt, save, onFix };
