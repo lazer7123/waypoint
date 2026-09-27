@@ -32,7 +32,7 @@ const RT = {
   pose: null, walkHeading: null,
   steps: new G.StepDetector(), filter: new G.PosFilter(), accel: NaN,
   fix: null, fixes: 0, lastStepT: -1e9, lastCand: -1e9, streak: 0, walkSteps: 0, yawRate: 0, prevH: null, prevHT: 0,
-  sawAbs: false, lastOrientT: -1e9, decl: 0, declAt: null, home: "ar", lastOk: -1e9, frameErr: null, alt: null, geoErr: null, geoStarted: false,
+  sawAbs: false, lastOrientT: -1e9, decl: 0, declAt: null, home: "ar", hist: 0, pendingGo: 0, navigating: false, frameErr: null, alt: null, geoErr: null, geoStarted: false,
   toastUntil: 0, confirm: null, calStep: 0, calCaps: [], calMsg: "",
 };
 
@@ -295,63 +295,163 @@ function toast(text, ms = 2200) {
 }
 
 // ---------- menus ----------
+// Menus are real buttons. Swipes move focus between them; a pinch presses the focused one
+// (the glasses send Enter to the focused element, which a <button> turns into a click).
+// "Back" is the glasses' own back gesture (history.back or Escape) — no in-app Back buttons.
 
 function openList(build) {
   if (RT.screen === "list") RT.stack.push(RT.list);
   RT.list = { build, sel: 0 };
   RT.confirm = null;
-  RT.screen = "list";
+  go("list");
   renderList();
+  syncHistory();
 }
-function back() {
+function closeAll() {
+  RT.stack = []; RT.list = null; RT.confirm = null;
+  go(RT.home);
+  syncHistory();
+}
+function stepBack() {
   RT.confirm = null;
-  if (RT.stack.length) { RT.list = RT.stack.pop(); RT.screen = "list"; renderList(); }
-  else closeAll();
+  if (RT.screen === "list") {
+    if (RT.stack.length) { RT.list = RT.stack.pop(); go("list"); renderList(); }
+    else { RT.list = null; go(RT.home); }
+  } else if (RT.screen === "calib" && S.cal) go(RT.home);
+  else if (RT.screen === "map") { RT.home = "ar"; go("ar"); }
 }
-function closeAll() { RT.stack = []; RT.list = null; RT.confirm = null; go(RT.home); }
+function goBack() { stepBack(); syncHistory(); }
 function go(screen) {
   RT.screen = screen;
   panel.hidden = screen !== "list";
+  if (screen !== "list" && panel.contains(document.activeElement)) {
+    RT.navigating = true; // leaving a half-typed name box must not drop a pin
+    document.activeElement.blur();
+    RT.navigating = false;
+  }
 }
+
+// Keep one browser-history entry per level, so the glasses' back gesture steps back one level.
+function depth() {
+  return (RT.home === "map" ? 1 : 0) + (RT.screen === "list" ? RT.stack.length + 1 : 0) + (RT.screen === "calib" && S.cal ? 1 : 0);
+}
+function syncHistory() {
+  const d = depth();
+  try {
+    // A history.go() of ours is still in flight: catch up when it lands (see popstate).
+    if (RT.pendingGo && performance.now() - RT.pendingGo < 1000) return;
+    RT.pendingGo = 0;
+    while (RT.hist < d) { RT.hist++; history.pushState({ wp: RT.hist }, ""); }
+    if (RT.hist > d) { RT.pendingGo = performance.now(); RT.pendingTo = d; history.go(d - RT.hist); RT.hist = d; }
+  } catch { /* history unavailable: Escape still works */ }
+}
+window.addEventListener("popstate", (e) => {
+  const at = e.state && Number.isInteger(e.state.wp) ? e.state.wp : 0;
+  RT.hist = at;
+  if (RT.pendingGo && at === RT.pendingTo) { RT.pendingGo = 0; syncHistory(); return; } // our own step landed
+  RT.pendingGo = 0;
+  // The back gesture: close app levels until we're as deep as the history entry we landed on.
+  let guard = 12;
+  while (depth() > at && guard--) stepBack();
+  syncHistory(); // also drops stale entries left over from before a reload
+});
+try { history.replaceState({ wp: 0 }, ""); } catch { /* ignore */ }
 
 function renderList() {
   const L = RT.list;
   if (!L) return;
   const def = L.build();
   L.def = def;
-  L.sel = G.clamp(L.sel, 0, def.items.length - 1);
-  panel.hidden = false;
+  const n = def.items.length;
+  L.sel = n ? G.clamp(L.sel, 0, n - 1) : 0;
   titleEl.textContent = def.title;
+  RT.navigating = true;
   listEl.innerHTML = "";
+  RT.navigating = false;
   def.items.forEach((it, i) => {
     const li = document.createElement("li");
-    if (i === L.sel) li.classList.add("sel");
-    if (it.danger) li.classList.add("danger");
-    if (!it.enter && !it.left && !it.right) li.classList.add("info");
-    const a = document.createElement("span");
-    a.textContent = it.label;
-    li.append(a);
-    if (it.value) {
-      const v = document.createElement("span");
-      v.className = "val";
-      const adjustable = it.left || it.right;
-      v.textContent = (adjustable && i === L.sel ? "‹ " : "") + it.value() + (adjustable && i === L.sel ? " ›" : "");
-      li.append(v);
+    let el;
+    if (it.input) {
+      // A text box opens the glasses' voice/handwriting input when you pinch it.
+      el = document.createElement("input");
+      el.type = "text";
+      el.placeholder = it.label;
+      el.className = "item focusable input";
+      el.enterKeyHint = "done";
+      const submit = () => {
+        const v = el.value.trim();
+        if (!v || RT.navigating || document.hidden || !document.hasFocus()) return;
+        el.value = "";
+        ((L.def && L.def.items[i]) || it).submit(v);
+      };
+      // Submit when the glasses' voice/handwriting input commits (focus stays here) or on Enter —
+      // never just because you swiped away from a half-finished name.
+      el.addEventListener("change", submit);
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && el.value.trim()) { e.preventDefault(); e.stopPropagation(); submit(); }
+      });
+    } else if (it.enter || it.left || it.right) {
+      el = document.createElement("button");
+      el.type = "button";
+      el.className = "item focusable";
+      if (it.danger) el.classList.add("danger");
+      el.innerHTML = '<span class="lbl"></span><span class="val"></span>';
+      el.addEventListener("click", () => {
+        L.sel = i;
+        const cur = (L.def && L.def.items[i]) || it; // the item as it is now (e.g. "Pinch again to delete")
+        if (cur.enter) cur.enter();
+        else if (cur.right) { cur.right(); refreshValues(); } // pinching a setting steps it too
+      });
+    } else {
+      el = document.createElement("div");
+      el.className = "item info";
+      el.innerHTML = '<span class="lbl"></span><span class="val"></span>';
     }
-    li.addEventListener("click", () => {
-      if (performance.now() - RT.lastOk < 300) return; // the same pinch already arrived as Enter
-      L.sel = i; renderList(); handleKey("ok");
+    el.dataset.i = i;
+    el.addEventListener("focus", () => {
+      if (L.sel !== i) { L.sel = i; if (RT.confirm) { RT.confirm = null; refreshValues(); } }
+      el.scrollIntoView({ block: "nearest" });
     });
+    li.append(el);
     listEl.append(li);
   });
-  hintEl.textContent = typeof def.hint === "function" ? def.hint() : def.hint || "";
-  const sel = listEl.children[L.sel];
-  if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: "nearest" });
+  refreshValues();
+  focusSel();
 }
 
-function activate() {
-  const it = RT.list?.def?.items[RT.list.sel];
-  if (it && it.enter) it.enter();
+/** Update labels/values in place (keeps focus), e.g. live sensor readings or a changed setting. */
+function refreshValues() {
+  const L = RT.list;
+  if (!L || !L.def) return;
+  const def = L.build();
+  if (def.items.length !== L.def.items.length) { L.def = def; renderList(); return; }
+  L.def = def;
+  titleEl.textContent = def.title;
+  hintEl.textContent = typeof def.hint === "function" ? def.hint() : def.hint || "";
+  def.items.forEach((it, i) => {
+    const el = listEl.querySelector(`[data-i="${i}"]`);
+    if (!el || it.input) return;
+    const adjustable = it.left || it.right;
+    el.querySelector(".lbl").textContent = it.label;
+    el.querySelector(".val").textContent = it.value ? (adjustable ? `‹ ${it.value()} ›` : it.value()) : "";
+    el.classList.toggle("danger", !!it.danger);
+  });
+}
+
+function focusSel() {
+  const el = listEl.querySelector(`[data-i="${RT.list.sel}"]`);
+  const target = el && el.matches(".focusable") ? el : listEl.querySelector(".focusable");
+  if (target) target.focus({ preventScroll: false });
+}
+
+function moveFocus(dir) {
+  const items = [...listEl.querySelectorAll(".focusable")];
+  if (!items.length) return;
+  const i = items.indexOf(document.activeElement);
+  const next = i < 0 ? 0 : (i + dir + items.length) % items.length;
+  RT.navigating = true;
+  items[next].focus();
+  RT.navigating = false;
 }
 
 const setFloor = (f) => { S.floor = G.clamp(Math.round(f), -9, 200); save(); };
@@ -371,37 +471,35 @@ function mainMenu() {
       { label: "Sensors", enter: () => openList(sensorsMenu) },
       { label: "Calibrate", enter: () => startCalib() },
       { label: "Settings", enter: () => openList(settingsMenu) },
-      { label: RT.home === "map" ? "Back to map" : "Back to view", enter: closeAll },
     ],
-    hint: "Swipe up/down to move · pinch to choose · swipe sideways to change a value",
+    hint: "Swipe to move · pinch to choose · back gesture to close",
   };
 }
 
 function dropMenu() {
+  const drop = (name) => { dropPin(name); closeAll(); };
   return {
     title: `Drop pin · floor ${S.floor}`,
-    items: [...NAMES.map((n) => ({ label: n, enter: () => { dropPin(uniqueName(n)); closeAll(); } })),
-            { label: "Back", enter: back }],
-    hint: RT.filter.sigma > 25 ? "Location is rough right now (weak GPS)" : "Pick a name",
+    items: [
+      { input: true, label: "Say or write a name…", submit: (v) => drop(uniqueName(v.slice(0, 30))) },
+      ...NAMES.map((n) => ({ label: n, enter: () => drop(uniqueName(n)) })),
+    ],
+    hint: RT.filter.sigma > 25 ? "Location is rough right now (weak GPS)" : "Pick a name, or pinch the top box to say one",
   };
 }
 
 function pinsMenu() {
-  const items = pinsByDistance().map((p) => {
-    const rel = relOf(p);
-    return {
-      label: `${S.target === p.id ? "▸ " : ""}${p.name}`,
-      value: () => `${rel ? G.fmtDist(rel.flat, S.settings.units) : "?"} · fl ${p.floor}`,
-      enter: () => openList(() => pinMenu(p)),
-    };
-  });
+  const items = pinsByDistance().map((p) => ({
+    label: `${S.target === p.id ? "▸ " : ""}${p.name}`,
+    value: () => { const rel = relOf(p); return `${rel ? G.fmtDist(rel.flat, S.settings.units) : "?"} · fl ${p.floor}`; },
+    enter: () => openList(() => pinMenu(p)),
+  }));
   if (!items.length) items.push({ label: "No pins yet" });
-  items.push({ label: "Back", enter: back });
   return { title: "Pins", items, hint: "Nearest first" };
 }
 
 function pinMenu(pin) {
-  if (!S.pins.includes(pin)) return { title: "Pin deleted", items: [{ label: "Back", enter: back }] };
+  if (!S.pins.includes(pin)) return { title: "Pin deleted", items: [{ label: "Use the back gesture" }] };
   const guiding = S.target === pin.id;
   const confirming = RT.confirm === `del:${pin.id}`;
   const when = new Date(pin.t).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
@@ -410,10 +508,9 @@ function pinMenu(pin) {
     items: [
       guiding ? { label: "Stop guiding", enter: () => { S.target = null; save(); closeAll(); } }
               : { label: "Guide me here", enter: () => { S.target = pin.id; save(); closeAll(); toast(`Guiding to ${pin.name}`); } },
-      { label: "Move pin to where I am", enter: () => { movePinHere(pin); back(); } },
+      { label: "Move pin to where I am", enter: () => { movePinHere(pin); goBack(); } },
       { label: confirming ? "Pinch again to delete" : "Delete", danger: true,
-        enter: () => { if (confirming) { deletePin(pin); back(); } else { RT.confirm = `del:${pin.id}`; renderList(); } } },
-      { label: "Back", enter: back },
+        enter: () => { if (confirming) { deletePin(pin); goBack(); } else { RT.confirm = `del:${pin.id}`; refreshValues(); } } },
     ],
     hint: `Floor ${pin.floor} · ${when}${pin.prov ? " · steps only" : pin.acc > 25 ? " · rough spot" : ""}`,
   };
@@ -423,24 +520,24 @@ function settingsMenu() {
   const s = S.settings;
   const set = (k, v) => { s[k] = v; save(); };
   const confirming = RT.confirm === "delall";
+  const flip = (k, a, b) => () => set(k, s[k] === a ? b : a);
   return {
     title: "Settings",
     items: [
-      { label: "Units", value: () => (s.units === "ft" ? "feet" : "metres"), left: () => set("units", s.units === "ft" ? "m" : "ft"), right: () => set("units", s.units === "ft" ? "m" : "ft") },
-      { label: "Height from", value: () => (s.heightMode === "floors" ? "floors" : "phone altitude"), left: () => set("heightMode", s.heightMode === "floors" ? "altitude" : "floors"), right: () => set("heightMode", s.heightMode === "floors" ? "altitude" : "floors") },
+      { label: "Units", value: () => (s.units === "ft" ? "feet" : "metres"), left: flip("units", "ft", "m"), right: flip("units", "ft", "m") },
+      { label: "Height from", value: () => (s.heightMode === "floors" ? "floors" : "phone altitude"), left: flip("heightMode", "floors", "altitude"), right: flip("heightMode", "floors", "altitude") },
       { label: "Floor height", value: fmtFloorH, left: () => set("floorH", G.clamp(+(s.floorH - 0.1).toFixed(1), 2.4, 6)), right: () => set("floorH", G.clamp(+(s.floorH + 0.1).toFixed(1), 2.4, 6)) },
       { label: "Step tracking", value: () => (s.steps ? "on" : "off"), left: () => set("steps", !s.steps), right: () => set("steps", !s.steps) },
       { label: "Step length", value: () => (s.units === "ft" ? `${(s.stepLen * 3.28084).toFixed(1)} ft` : `${s.stepLen.toFixed(2)} m`), left: () => set("stepLen", G.clamp(+(s.stepLen - 0.05).toFixed(2), 0.4, 1.1)), right: () => set("stepLen", G.clamp(+(s.stepLen + 0.05).toFixed(2), 0.4, 1.1)) },
       { label: "Step sensitivity", value: () => s.stepSens.toFixed(1), left: () => set("stepSens", G.clamp(+(s.stepSens - 0.1).toFixed(1), 0.3, 4)), right: () => set("stepSens", G.clamp(+(s.stepSens + 0.1).toFixed(1), 0.3, 4)) },
       { label: "GPS", value: () => ({ auto: "auto", always: "always", off: "off (indoors)" })[s.gps], left: () => set("gps", cycle(["auto", "always", "off"], s.gps, -1)), right: () => set("gps", cycle(["auto", "always", "off"], s.gps, 1)) },
       { label: "View width", value: () => `${s.fov}°`, left: () => set("fov", G.clamp(s.fov - 1, 5, 60)), right: () => set("fov", G.clamp(s.fov + 1, 5, 60)) },
-      { label: "Compass north", value: () => (s.north === "magnetic" ? `magnetic (fix ${fmtDecl()})` : "true"), left: () => set("north", s.north === "magnetic" ? "true" : "magnetic"), right: () => set("north", s.north === "magnetic" ? "true" : "magnetic") },
+      { label: "Compass north", value: () => (s.north === "magnetic" ? `magnetic (fix ${fmtDecl()})` : "true"), left: flip("north", "magnetic", "true"), right: flip("north", "magnetic", "true") },
       { label: "Heading trim", value: () => `${s.offset > 0 ? "+" : ""}${s.offset}°`, left: () => set("offset", G.clamp(s.offset - 1, -180, 180)), right: () => set("offset", G.clamp(s.offset + 1, -180, 180)) },
       { label: confirming ? "Pinch again to delete ALL pins" : "Delete all pins", danger: true,
-        enter: () => { if (confirming) { S.pins = []; S.target = null; RT.confirm = null; save(); toast("All pins deleted"); renderList(); } else { RT.confirm = "delall"; renderList(); } } },
-      { label: "Back", enter: back },
+        enter: () => { if (confirming) { S.pins = []; S.target = null; RT.confirm = null; save(); toast("All pins deleted"); } else RT.confirm = "delall"; refreshValues(); } },
     ],
-    hint: "Swipe sideways to change",
+    hint: "Swipe sideways (or pinch) to change",
   };
 }
 
@@ -462,7 +559,6 @@ function sensorsMenu() {
       { label: "GPS", value: () => (fix ? `±${fmt(fix.acc)} m · ${age}s ago · ${RT.fixes}` : RT.geoErr || "waiting") },
       { label: "Altitude", value: () => (fix && Number.isFinite(fix.alt) ? `${fmt(fix.alt, 1)} m ±${fmt(fix.altAcc)} (avg ${fmt(RT.alt, 1)})` : "none") },
       { label: "My position", value: () => (S.work ? `±${fmt(f.sigma)} m${S.work.prov ? " (steps only)" : ""}` : "unknown") },
-      { label: "Back", enter: back },
     ],
     hint: "Heading row: swipe sideways to match your iPhone Compass",
   };
@@ -480,6 +576,7 @@ function startCalib() {
   RT.stack = []; RT.list = null;
   RT.calStep = 0; RT.calCaps = []; RT.calMsg = "";
   go("calib");
+  syncHistory();
 }
 
 function captureCal() {
@@ -501,26 +598,39 @@ function captureCal() {
   RT.Rs = null;
   save();
   go(RT.home);
+  syncHistory();
   toast("Calibrated");
 }
 
 // ---------- input ----------
 
 document.addEventListener("keydown", (e) => {
-  const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right", Enter: "ok", " ": "ok", Escape: "back", Backspace: "back" };
+  const map = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right", Enter: "ok", Escape: "back" };
   const k = map[e.key];
   if (!k) return;
+  if (RT.screen === "list") {
+    const inField = document.activeElement && document.activeElement.tagName === "INPUT";
+    if (k === "ok") {
+      if (e.repeat) { e.preventDefault(); return; } // a held pinch presses once
+      // The focused button handles the pinch itself (Enter → click). Only step in if nothing is focused.
+      if (!panel.contains(document.activeElement)) { e.preventDefault(); focusSel(); }
+      return;
+    }
+    if (inField && (k === "left" || k === "right")) return; // let the text box have its cursor keys
+    e.preventDefault();
+    if (k === "back") { goBack(); return; }
+    if (k === "up" || k === "down") { moveFocus(k === "up" ? -1 : 1); return; }
+    const it = RT.list?.def?.items[RT.list.sel];
+    if (it && it[k]) { it[k](); refreshValues(); }
+    return;
+  }
   e.preventDefault();
   if (e.repeat && k === "ok") return;
   handleKey(k);
 });
 
+/** Keys on the full-screen views (start, 3D view, map, calibration). */
 function handleKey(k) {
-  if (k === "ok") {
-    const now = performance.now();
-    if (now - RT.lastOk < 300) return; // one pinch can arrive as both a click and Enter
-    RT.lastOk = now;
-  }
   switch (RT.screen) {
     case "start":
       if (k === "ok") begin();
@@ -535,29 +645,15 @@ function handleKey(k) {
       else if (k === "down") { S.mapZoom = Math.max(12, S.mapZoom - 1); save(); }
       else if (k === "left") cycleTarget(-1);
       else if (k === "right") cycleTarget(1);
-      else if (k === "back") { RT.home = "ar"; go("ar"); }
+      else if (k === "back") goBack();
       else if (k === "ok") openList(mainMenu);
       break;
     case "calib":
       if (k === "ok") captureCal();
-      else if ((k === "back" || k === "down") && S.cal) go(RT.home);
+      else if (k === "back") goBack();
       break;
-    case "list": {
-      const L = RT.list;
-      const it = L.def.items[L.sel];
-      if (k === "up") { L.sel = (L.sel - 1 + L.def.items.length) % L.def.items.length; RT.confirm = null; }
-      else if (k === "down") { L.sel = (L.sel + 1) % L.def.items.length; RT.confirm = null; }
-      else if (k === "left" && it.left) it.left();
-      else if (k === "right" && it.right) it.right();
-      else if (k === "ok") { activate(); return; }
-      else if (k === "back") { back(); return; }
-      if (RT.screen === "list") renderList();
-      break;
-    }
   }
 }
-
-canvas.addEventListener("click", () => handleKey("ok"));
 
 async function begin() {
   // Both permission requests must start inside the pinch (a user gesture).
@@ -566,7 +662,7 @@ async function begin() {
   try { if (window.DeviceMotionEvent?.requestPermission) asks.push(DeviceMotionEvent.requestPermission()); } catch { /* ignore */ }
   startGeo();
   await Promise.allSettled(asks);
-  if (!S.cal) startCalib(); else go(RT.home);
+  if (!S.cal) startCalib(); else { go(RT.home); syncHistory(); }
 }
 
 // ---------- drawing ----------
@@ -606,8 +702,13 @@ function updateDecl() {
 }
 function fmtDecl() { return RT.declAt ? `${RT.decl >= 0 ? "+" : ""}${RT.decl.toFixed(1)}°` : "needs GPS"; }
 
-function frame() {
-  requestAnimationFrame(frame); // keep drawing even if something below throws
+let lastDraw = 0;
+function frame(now) {
+  requestAnimationFrame(frame); // keep going even if something below throws
+  if (now - lastDraw < 32) return; // ~30 fps is plenty and saves battery
+  lastDraw = now;
+  if (!toastEl.hidden && performance.now() > RT.toastUntil) toastEl.hidden = true;
+  if (RT.screen === "list") return; // the menu covers the view
   try {
     updateDecl();
     if (S.cal) S.cal.offset = S.settings.offset + (S.settings.north === "magnetic" ? RT.decl : 0);
@@ -863,8 +964,8 @@ function drawMap() {
 // ---------- go ----------
 
 load();
-setInterval(() => { if (RT.screen === "list" && RT.list?.def?.live) renderList(); }, 250);
+setInterval(() => { if (RT.screen === "list" && RT.list?.def?.live) refreshValues(); }, 250);
 requestAnimationFrame(frame);
 
 // For testing in a browser: window.__waypoint exposes state (harmless on the glasses).
-window.__waypoint = { S, RT, G, handleKey };
+window.__waypoint = { S, RT, G, handleKey, goBack };
